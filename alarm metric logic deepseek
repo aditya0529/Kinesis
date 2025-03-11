@@ -1,4 +1,4 @@
-The best metrics to scale up and down shards for Amazon Kinesis are those that accurately reflect the stream's usage and capacity. These metrics help determine when the stream is nearing its limits (scale up) or underutilized (scale down). Below are the recommended metrics and their explanations:
+The best metrics to scale up and down shards for Amazon Kinesis are those thcat accurately reflect the stream's usage and capacity. These metrics help determine when the stream is nearing its limits (scale up) or underutilized (scale down). Below are the recommended metrics and their explanations:
 
 1. Key Metrics for Scaling Kinesis Shards
 a. IncomingBytes
