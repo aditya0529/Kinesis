@@ -1,0 +1,951 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudFormation template to deploy a Kinesis stream auto-scaling solution
+  with the Lambda function code inlined (Python-based). It creates:
+  - A Python Lambda that updates Kinesis shard counts based on CloudWatch alarms
+  - Two Kinesis streams (with scale-up and scale-down alarms each)
+  - An SNS topic that triggers the Lambda
+  - Necessary IAM roles/policies
+
+Parameters:
+  KinesisScaleUpThreshold:
+    Type: Number
+    Description: At what total usage streams scale up? (1.0 = 100%)
+    Default: 0.75
+
+  KinesisScaleDownThreshold:
+    Type: Number
+    Description: At what total usage streams scale down? (1.0 = 100%)
+    Default: 0.25
+
+  KinesisScaleDownMinIterAgeMins:
+    Type: Number
+    Description: Do not scale down if behind by this many minutes (-1 disables).
+    Default: -1
+
+  ScalingDryRun:
+    Type: String
+    Description: 'If true, Lambda logs scaling steps without making changes.'
+    Default: false
+    AllowedValues:
+      - true
+      - false
+
+Resources:
+  ###############################################################################
+  #
+  # Auto Scaling Lambda Function (Python code inlined)
+  #
+  ###############################################################################
+  AutoScalingLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: AutoScalingLambdaRole
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-kinesis-scaling'
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Role: !GetAtt AutoScalingLambdaRole.Arn
+      ReservedConcurrentExecutions: 1
+      MemorySize: 512
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import logging
+          import random
+          import time
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+
+          # Set up logging in JSON format.
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create global boto3 clients.
+          cloudwatch_client = boto3.client('cloudwatch')
+          kinesis_client = boto3.client('kinesis')
+          lambda_client = boto3.client('lambda')
+
+          # Read configuration from environment variables.
+          SCALE_PERIOD_MINS = int(os.environ.get("SCALE_PERIOD_MINS", "5"))
+          SCALE_UP_EVALUATION_PERIOD = int(os.environ.get("SCALE_UP_EVALUATION_PERIOD", str(25 // SCALE_PERIOD_MINS)))
+          SCALE_DOWN_EVALUATION_PERIOD = int(os.environ.get("SCALE_DOWN_EVALUATION_PERIOD", str(300 // SCALE_PERIOD_MINS)))
+          SCALE_UP_DATAPOINTS_REQUIRED = int(os.environ.get("SCALE_UP_DATAPOINTS_REQUIRED", str(25 // SCALE_PERIOD_MINS)))
+          SCALE_DOWN_DATAPOINTS_REQUIRED = int(os.environ.get("SCALE_DOWN_DATAPOINTS_REQUIRED", str(285 // SCALE_PERIOD_MINS)))
+          SCALE_DOWN_MIN_ITER_AGE_MINS = int(os.environ.get("SCALE_DOWN_MIN_ITER_AGE_MINS", "30"))
+          SCALE_UP_THRESHOLD = float(os.environ.get("SCALE_UP_THRESHOLD", "0.25"))
+          SCALE_DOWN_THRESHOLD = float(os.environ.get("SCALE_DOWN_THRESHOLD", "0.075"))
+          THROTTLE_RETRY_MIN_SLEEP = int(os.environ.get("THROTTLE_RETRY_MIN_SLEEP", "1"))
+          THROTTLE_RETRY_MAX_SLEEP = int(os.environ.get("THROTTLE_RETRY_MAX_SLEEP", "3"))
+          THROTTLE_RETRY_COUNT = int(os.environ.get("THROTTLE_RETRY_COUNT", "30"))
+          DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+          SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
+          PROCESSING_LAMBDA_ARN = os.environ.get("PROCESSING_LAMBDA_ARN", "")
+          PROCESSING_LAMBDAS_PER_SHARD = int(os.environ.get("PROCESSING_LAMBDAS_PER_SHARD", "1"))
+          FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "unknown")
+          VERSION = os.environ.get("version", "")
+          DEPLOYMENT_RING = os.environ.get("deploymentRing", "")
+
+          FATAL_ERROR_METRIC = "FATAL_ERROR_KINESIS_SCALING"
+
+          # ----------------------------------------------------------------------
+          # Helper functions
+          # ----------------------------------------------------------------------
+
+          def update_alarm(alarm_name, evaluation_period, datapoints_required, threshold,
+                           comparison_operator, stream_name, alarm_actions, new_shard_count,
+                           is_scale_down, scale_down_min_iter_age_mins):
+              period_mins = 5
+              retry_count = 0
+              while retry_count < THROTTLE_RETRY_COUNT:
+                  try:
+                      metrics = []
+                      # m1: IncomingBytes
+                      metrics.append({
+                          "Id": "m1",
+                          "Label": "IncomingBytes",
+                          "ReturnData": False,
+                          "MetricStat": {
+                              "Metric": {
+                                  "Namespace": "AWS/Kinesis",
+                                  "MetricName": "IncomingBytes",
+                                  "Dimensions": [{"Name": "StreamName", "Value": stream_name}]
+                              },
+                              "Period": 60 * period_mins,
+                              "Stat": "Sum"
+                          }
+                      })
+                      # m2: IncomingRecords
+                      metrics.append({
+                          "Id": "m2",
+                          "Label": "IncomingRecords",
+                          "ReturnData": False,
+                          "MetricStat": {
+                              "Metric": {
+                                  "Namespace": "AWS/Kinesis",
+                                  "MetricName": "IncomingRecords",
+                                  "Dimensions": [{"Name": "StreamName", "Value": stream_name}]
+                              },
+                              "Period": 60 * period_mins,
+                              "Stat": "Sum"
+                          }
+                      })
+                      # m3: Iterator age (only if scale down)
+                      if is_scale_down:
+                          metrics.append({
+                              "Id": "m3",
+                              "Label": "IteratorAgeMilliseconds",
+                              "ReturnData": False,
+                              "MetricStat": {
+                                  "Metric": {
+                                      "Namespace": "AWS/Kinesis",
+                                      "MetricName": "GetRecords.IteratorAgeMilliseconds",
+                                      "Dimensions": [{"Name": "StreamName", "Value": stream_name}]
+                                  },
+                                  "Period": 60 * period_mins,
+                                  "Stat": "Maximum"
+                              }
+                          })
+                      # e1, e2: Fill missing data with 0
+                      metrics.append({"Id": "e1", "Expression": "FILL(m1,0)", "Label": "FillMissingDataPointsBytes", "ReturnData": False})
+                      metrics.append({"Id": "e2", "Expression": "FILL(m2,0)", "Label": "FillMissingDataPointsRecords", "ReturnData": False})
+                      # e3, e4: Usage factors
+                      metrics.append({
+                          "Id": "e3",
+                          "Expression": f"e1/(1024*1024*60*{period_mins}*s1)",
+                          "Label": "IncomingBytesUsageFactor",
+                          "ReturnData": False
+                      })
+                      metrics.append({
+                          "Id": "e4",
+                          "Expression": f"e2/(1000*60*{period_mins}*s1)",
+                          "Label": "IncomingRecordsUsageFactor",
+                          "ReturnData": False
+                      })
+                      # e5, e6
+                      if is_scale_down:
+                          metrics.append({
+                              "Id": "e5",
+                              "Expression": f"(FILL(m3,0)/1000/60)*({threshold}/s2)",
+                              "Label": "IteratorAgeAdjustedFactor",
+                              "ReturnData": False
+                          })
+                          metrics.append({
+                              "Id": "e6",
+                              "Expression": "MAX([e3,e4,e5])",
+                              "Label": "MaxIncomingUsageFactor",
+                              "ReturnData": True
+                          })
+                      else:
+                          metrics.append({
+                              "Id": "e6",
+                              "Expression": "MAX([e3,e4])",
+                              "Label": "MaxIncomingUsageFactor",
+                              "ReturnData": True
+                          })
+                      # s1
+                      metrics.append({
+                          "Id": "s1",
+                          "Expression": f"{new_shard_count}",
+                          "Label": "ShardCount",
+                          "ReturnData": False
+                      })
+                      if is_scale_down:
+                          metrics.append({
+                              "Id": "s2",
+                              "Expression": f"{scale_down_min_iter_age_mins}",
+                              "Label": "IteratorAgeMinutesBlockDown",
+                              "ReturnData": False
+                          })
+                      response = cloudwatch_client.put_metric_alarm(
+                          AlarmName=alarm_name,
+                          AlarmDescription="Alarm to scale Kinesis stream",
+                          ActionsEnabled=True,
+                          AlarmActions=alarm_actions,
+                          EvaluationPeriods=evaluation_period,
+                          DatapointsToAlarm=datapoints_required,
+                          Threshold=threshold,
+                          ComparisonOperator=comparison_operator,
+                          TreatMissingData="ignore",
+                          Metrics=metrics
+                      )
+                      return response
+                  except ClientError as e:
+                      error_code = e.response.get('Error', {}).get('Code')
+                      if error_code == "LimitExceededException":
+                          retry_count += 1
+                          sleep_time = random.randint(THROTTLE_RETRY_MIN_SLEEP, THROTTLE_RETRY_MAX_SLEEP)
+                          time.sleep(sleep_time)
+                      else:
+                          break
+              raise Exception(f"Failed to update alarm {alarm_name} after retries.")
+
+          def set_alarm_state(alarm_name, state, reason):
+              retry_count = 0
+              while retry_count < THROTTLE_RETRY_COUNT:
+                  try:
+                      response = cloudwatch_client.set_alarm_state(
+                          AlarmName=alarm_name,
+                          StateValue=state,
+                          StateReason=reason
+                      )
+                      return response
+                  except ClientError as e:
+                      error_code = e.response.get('Error', {}).get('Code')
+                      if error_code == "LimitExceededException":
+                          retry_count += 1
+                          sleep_time = random.randint(THROTTLE_RETRY_MIN_SLEEP, THROTTLE_RETRY_MAX_SLEEP)
+                          time.sleep(sleep_time)
+                      else:
+                          break
+              raise Exception(f"Failed to set alarm state for {alarm_name} after retries.")
+
+          def calculate_new_shard_count(scale_action, down_threshold, current_shard_count):
+              if scale_action == "Up":
+                  target_shard_count = current_shard_count * 2
+              elif scale_action == "Down":
+                  target_shard_count = current_shard_count // 2
+                  if target_shard_count <= 1:
+                      target_shard_count = 1
+                      down_threshold = -1.0
+              else:
+                  raise Exception("Invalid scale action")
+              return target_shard_count, down_threshold
+
+          def get_stream_name(alarm_info):
+              try:
+                  metrics = alarm_info["Trigger"]["Metrics"]
+                  for metric in metrics:
+                      if "MetricStat" in metric and metric["Id"] in ["m1","m2"]:
+                          dimensions = metric["MetricStat"]["Metric"].get("Dimensions", [])
+                          for d in dimensions:
+                              if d.get("Name") == "StreamName":
+                                  return d.get("Value")
+              except Exception as e:
+                  logger.error("Error extracting stream name: %s", e)
+              return None
+
+          def parse_alarm_name_and_tags(tags_response, current_alarm_name):
+              scale_down_suffix = "-scale-down"
+              scale_up_suffix = "-scale-up"
+              scale_up_alarm_name = ""
+              scale_down_alarm_name = ""
+              current_alarm_action = ""
+              last_scaled_timestamp = ""
+
+              if current_alarm_name.endswith(scale_up_suffix):
+                  current_alarm_action = "Up"
+                  scale_up_alarm_name = current_alarm_name
+                  scale_down_alarm_name = current_alarm_name[:-len(scale_up_suffix)] + scale_down_suffix
+              elif current_alarm_name.endswith(scale_down_suffix):
+                  current_alarm_action = "Down"
+                  scale_up_alarm_name = current_alarm_name[:-len(scale_down_suffix)] + scale_up_suffix
+                  scale_down_alarm_name = current_alarm_name
+              else:
+                  logger.error("Invalid alarm name suffix: %s", current_alarm_name)
+
+              for tag in tags_response.get("Tags", []):
+                  if tag.get("Key") == "LastScaledTimestamp":
+                      last_scaled_timestamp = tag.get("Value")
+              return scale_up_alarm_name, scale_down_alarm_name, current_alarm_action, last_scaled_timestamp
+
+          def tag_alarm(alarm_arn, scale_action_key, complimentary_alarm_key, action_value, alarm_value, last_scaled_timestamp):
+              try:
+                  response = cloudwatch_client.tag_resource(
+                      ResourceARN=alarm_arn,
+                      Tags=[
+                          {"Key": scale_action_key, "Value": action_value},
+                          {"Key": complimentary_alarm_key, "Value": alarm_value},
+                          {"Key": "LastScaledTimestamp", "Value": last_scaled_timestamp}
+                      ]
+                  )
+                  return response
+              except ClientError as e:
+                  logger.error("Error tagging alarm: %s", e)
+                  raise e
+
+          def check_last_scaled_timestamp(last_scaled_timestamp, alarm_time, scaling_period_mins):
+              if not last_scaled_timestamp:
+                  return True
+              try:
+                  state_change_time = datetime.strptime(alarm_time, "%Y-%m-%dT%H:%M:%S.%f%z")
+                  last_scaled = datetime.strptime(last_scaled_timestamp, "%Y-%m-%dT%H:%M:%S.%f%z")
+              except Exception as e:
+                  logger.error("Timestamp parse error: %s", e)
+                  return True
+              if state_change_time <= last_scaled:
+                  return False
+              next_allowed = last_scaled + timedelta(minutes=scaling_period_mins)
+              if state_change_time < next_allowed:
+                  return False
+              return True
+
+          def error_handler(err, message, current_alarm_name, alarm_state_change):
+              logger.error("Error: %s, Message: %s", err, message)
+              if isinstance(err, ClientError):
+                  error_code = err.response['Error']['Code']
+                  if error_code == "ResourceInUseException":
+                      try:
+                          set_alarm_state(current_alarm_name, "OK", "ResourceInUse Exception from Kinesis, resetting alarm state for retry")
+                      except Exception as e:
+                          logger.error("Failed to set alarm state: %s", e)
+                  else:
+                      if alarm_state_change:
+                          try:
+                              set_alarm_state(current_alarm_name, "OK", message)
+                          except Exception as e:
+                              logger.error("Failed to set alarm state: %s", e)
+                      emit_scaling_lambda_metrics(FATAL_ERROR_METRIC)
+              else:
+                  emit_scaling_lambda_metrics(FATAL_ERROR_METRIC)
+
+          def get_alarm_arn(scale_up_alarm_name, scale_down_alarm_name):
+              try:
+                  response = cloudwatch_client.describe_alarms(AlarmNames=[scale_up_alarm_name, scale_down_alarm_name])
+                  scale_up_alarm_arn = ""
+                  scale_down_alarm_arn = ""
+                  for alarm in response.get("MetricAlarms", []):
+                      if alarm["AlarmName"] == scale_up_alarm_name:
+                          scale_up_alarm_arn = alarm["AlarmArn"]
+                      elif alarm["AlarmName"] == scale_down_alarm_name:
+                          scale_down_alarm_arn = alarm["AlarmArn"]
+                  return scale_up_alarm_arn, scale_down_alarm_arn
+              except ClientError as e:
+                  logger.error("Error describing alarms: %s", e)
+                  raise e
+
+          def update_concurrency(new_shard_count, producer_function_arn):
+              try:
+                  response = lambda_client.put_function_concurrency(
+                      FunctionName=producer_function_arn,
+                      ReservedConcurrentExecutions=new_shard_count
+                  )
+                  return response
+              except ClientError as e:
+                  logger.error("Error updating concurrency: %s", e)
+                  raise e
+
+          def delete_concurrency(producer_function_arn):
+              try:
+                  response = lambda_client.delete_function_concurrency(FunctionName=producer_function_arn)
+                  return response
+              except ClientError as e:
+                  logger.error("Error deleting concurrency: %s", e)
+                  raise e
+
+          def update_processing_lambda_concurrency(new_shard_count):
+              if not PROCESSING_LAMBDA_ARN:
+                  return
+              try:
+                  total_concurrency = new_shard_count * PROCESSING_LAMBDAS_PER_SHARD
+                  update_concurrency(total_concurrency, PROCESSING_LAMBDA_ARN)
+              except Exception as e:
+                  logger.error("Error updating processing lambda concurrency: %s", e)
+                  try:
+                      delete_concurrency(PROCESSING_LAMBDA_ARN)
+                  except Exception as ex:
+                      logger.error("Error deleting concurrency: %s", ex)
+
+          def emit_scaling_lambda_metrics(metric_name):
+              try:
+                  cloudwatch_client.put_metric_data(
+                      Namespace="AWS/Lambda",
+                      MetricData=[
+                          {
+                              "MetricName": metric_name,
+                              "Unit": "Count",
+                              "Value": 1.0,
+                              "Dimensions": [{"Name": "FunctionName", "Value": FUNCTION_NAME}]
+                          }
+                      ]
+                  )
+              except ClientError as e:
+                  logger.error("Error emitting metric data: %s", e)
+
+          # ----------------------------------------------------------------------
+          # Main Lambda handler
+          # ----------------------------------------------------------------------
+          def lambda_handler(event, context):
+              try:
+                  logger.info("Received event: %s", json.dumps(event))
+                  sns_record = event['Records'][0]['Sns']
+                  message_str = sns_record['Message']
+                  alarm_info = json.loads(message_str)
+
+                  current_alarm_name = alarm_info.get("AlarmName", "")
+                  logger.info("Current alarm name: %s", current_alarm_name)
+
+                  # List tags for the alarm
+                  alarm_arn = alarm_info.get("AlarmArn", "")
+                  tags_response = cloudwatch_client.list_tags_for_resource(ResourceARN=alarm_arn)
+
+                  scale_up_alarm_name, scale_down_alarm_name, current_alarm_action, last_scaled_timestamp = \
+                      parse_alarm_name_and_tags(tags_response, current_alarm_name)
+                  logger.info("Scale action determined: %s", current_alarm_action)
+
+                  # Extract the stream name
+                  stream_name = get_stream_name(alarm_info)
+                  if not stream_name:
+                      logger.error("Could not determine stream name from alarm info.")
+                      return
+
+                  logger.info("Stream name: %s", stream_name)
+
+                  # Check if scaling event is valid based on last scaled timestamp
+                  if not check_last_scaled_timestamp(last_scaled_timestamp, alarm_info.get("StateChangeTime", ""), 0):
+                      logger.info("Scaling event rejected due to timestamp check.")
+                      set_alarm_state(current_alarm_name, "INSUFFICIENT_DATA",
+                                      f"Scale-{current_alarm_action} event rejected. Setting alarm to Insufficient Data.")
+                      return
+
+                  # Retrieve current shard count
+                  stream_summary = kinesis_client.describe_stream_summary(StreamName=stream_name)
+                  current_shard_count = stream_summary['StreamDescriptionSummary']['OpenShardCount']
+                  new_shard_count, new_down_threshold = calculate_new_shard_count(
+                      current_alarm_action, SCALE_DOWN_THRESHOLD, current_shard_count)
+                  logger.info("Current shard count: %d, New shard count: %d", current_shard_count, new_shard_count)
+
+                  # Dry run check
+                  if DRY_RUN:
+                      logger.info("Dry run is enabled. No scaling performed.")
+                      return
+
+                  # Update the stream
+                  kinesis_client.update_shard_count(
+                      StreamName=stream_name,
+                      TargetShardCount=new_shard_count,
+                      ScalingType='UNIFORM_SCALING'
+                  )
+                  alarm_last_scaled_timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+
+                  # Update scale-up alarm
+                  update_alarm(
+                      scale_up_alarm_name,
+                      SCALE_UP_EVALUATION_PERIOD,
+                      SCALE_UP_DATAPOINTS_REQUIRED,
+                      SCALE_UP_THRESHOLD,
+                      "GreaterThanOrEqualToThreshold",
+                      stream_name,
+                      [SNS_TOPIC_ARN],
+                      new_shard_count,
+                      is_scale_down=False,
+                      scale_down_min_iter_age_mins=0
+                  )
+                  set_alarm_state(scale_up_alarm_name, "INSUFFICIENT_DATA", "Reconfigured after scaling")
+
+                  # Update scale-down alarm
+                  update_alarm(
+                      scale_down_alarm_name,
+                      SCALE_DOWN_EVALUATION_PERIOD,
+                      SCALE_DOWN_DATAPOINTS_REQUIRED,
+                      new_down_threshold,
+                      "LessThanThreshold",
+                      stream_name,
+                      [SNS_TOPIC_ARN],
+                      new_shard_count,
+                      is_scale_down=True,
+                      scale_down_min_iter_age_mins=SCALE_DOWN_MIN_ITER_AGE_MINS
+                  )
+                  set_alarm_state(scale_down_alarm_name, "INSUFFICIENT_DATA", "Reconfigured after scaling")
+
+                  # Tag alarms
+                  up_alarm_arn, down_alarm_arn = get_alarm_arn(scale_up_alarm_name, scale_down_alarm_name)
+                  tag_alarm(up_alarm_arn, "ScaleAction", "ComplimentaryAlarm", "Up", scale_down_alarm_name, alarm_last_scaled_timestamp)
+                  tag_alarm(down_alarm_arn, "ScaleAction", "ComplimentaryAlarm", "Down", scale_up_alarm_name, alarm_last_scaled_timestamp)
+
+                  # Update concurrency on the processing Lambda (if any)
+                  update_processing_lambda_concurrency(new_shard_count)
+
+                  logger.info("Scaling complete for stream: %s", stream_name)
+
+              except Exception as e:
+                  logger.exception("Error processing scaling event: %s", e)
+                  error_handler(e, "Error in scaling process", current_alarm_name if 'current_alarm_name' in locals() else "", True)
+                  raise e
+
+  AutoScalingLambdaAsyncConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    DependsOn: AutoScalingLambda
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-kinesis-scaling'
+      MaximumRetryAttempts: 0
+      Qualifier: $LATEST
+
+  ###############################################################################
+  #
+  # Auto Scaling Lambda IAM Role
+  #
+  ###############################################################################
+  AutoScalingLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AllowCreateCloudWatchAlarms
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:DescribeAlarms'
+                  - 'cloudwatch:GetMetricData'
+                  - 'cloudwatch:ListMetrics'
+                  - 'cloudwatch:PutMetricAlarm'
+                  - 'cloudwatch:PutMetricData'
+                  - 'cloudwatch:ListTagsForResource'
+                  - 'cloudwatch:SetAlarmState'
+                  - 'cloudwatch:TagResource'
+                Resource:
+                  - !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-AutoScalingStream*'
+        - PolicyName: AllowLoggingToCloudWatch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-kinesis-scaling:*'
+        - PolicyName: AllowReadFromKinesis
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kinesis:DescribeStreamSummary'
+                  - 'kinesis:AddTagsToStream'
+                  - 'kinesis:ListTagsForStream'
+                  - 'kinesis:UpdateShardCount'
+                Resource:
+                  - !Sub 'arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${AWS::StackName}-AutoScalingStream*'
+        - PolicyName: AllowPublishToSNS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource:
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-kinesis-scaling-topic'
+        - PolicyName: AllowChangeFunctionConcurrencyForLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:PutFunctionConcurrency'
+                  - 'lambda:DeleteFunctionConcurrency'
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-your-kinesis-consumer-function-name-here'
+
+  ###############################################################################
+  #
+  # Auto Scaling SNS Topic
+  #
+  ###############################################################################
+  AutoScalingSNSTopic:
+    Type: AWS::SNS::Topic
+    DependsOn: AutoScalingLambda
+    Properties:
+      Subscription:
+        - Endpoint: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-kinesis-scaling'
+          Protocol: "lambda"
+      TopicName: !Sub '${AWS::StackName}-kinesis-scaling-topic'
+
+  AutoScalingSNSTopicLambdaPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Sub '${AWS::StackName}-kinesis-scaling'
+      Principal: "sns.amazonaws.com"
+      SourceArn: !Ref AutoScalingSNSTopic
+
+  ###############################################################################
+  #
+  # Kinesis Data Stream 01
+  #
+  ###############################################################################
+  AutoScalingStream01:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+
+  #
+  # Kinesis Data Stream 01 - Scale Up Alarm
+  #
+  AutoScalingStream01ScaleUpAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: [ AutoScalingStream01, AutoScalingSNSTopic ]
+    Properties:
+      AlarmName: !Join ['', [!Ref AutoScalingStream01, '-scale-up']]
+      AlarmDescription: 'Stream throughput has gone above the scale up threshold'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: !Ref KinesisScaleUpThreshold
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      AlarmActions: [ !Ref AutoScalingSNSTopic ]
+      Metrics:
+        - Id: s1
+          ReturnData: False
+          Label: ShardCount
+          Expression: 1
+        - Id: m1
+          ReturnData: False
+          Label: IncomingBytes
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              MetricName: IncomingBytes
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream01
+        - Id: m2
+          ReturnData: False
+          Label: IncomingRecords
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              MetricName: IncomingRecords
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream01
+        - Id: e1
+          ReturnData: False
+          Label: FillMissingDataPointsWithZeroForIncomingBytes
+          Expression: FILL(m1,0)
+        - Id: e2
+          ReturnData: False
+          Label: FillMissingDataPointsWithZeroForIncomingRecords
+          Expression: FILL(m2,0)
+        - Id: e3
+          ReturnData: False
+          Label: IncomingBytesUsageFactor
+          Expression: e1/(1024*1024*60*5*s1)
+        - Id: e4
+          ReturnData: False
+          Label: IncomingRecordsUsageFactor
+          Expression: e2/(1000*60*5*s1)
+        - Id: e5
+          ReturnData: True
+          Label: MaxIncomingUsageFactor
+          Expression: MAX([e3,e4])
+
+  #
+  # Kinesis Data Stream 01 - Scale Down Alarm
+  #
+  AutoScalingStream01ScaleDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: [ AutoScalingStream01, AutoScalingSNSTopic ]
+    Properties:
+      AlarmName: !Join ['', [!Ref AutoScalingStream01, '-scale-down']]
+      AlarmDescription: 'Stream throughput has gone below the scale down threshold'
+      ComparisonOperator: LessThanThreshold
+      Threshold: -1
+      EvaluationPeriods: 60
+      DatapointsToAlarm: 57
+      AlarmActions: [ !Ref AutoScalingSNSTopic ]
+      Metrics:
+        - Id: s1
+          ReturnData: False
+          Label: ShardCount
+          Expression: 1
+        - Id: s2
+          ReturnData: False
+          Label: IteratorAgeMinutesToBlockScaledowns
+          Expression: !Ref KinesisScaleDownMinIterAgeMins
+        - Id: m1
+          ReturnData: False
+          Label: IncomingBytes
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              MetricName: IncomingBytes
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream01
+        - Id: m2
+          ReturnData: False
+          Label: IncomingRecords
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              MetricName: IncomingRecords
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream01
+        - Id: m3
+          ReturnData: False
+          Label: GetRecords.IteratorAgeMilliseconds
+          MetricStat:
+            Stat: Maximum
+            Period: 300
+            Metric:
+              MetricName: GetRecords.IteratorAgeMilliseconds
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream01
+        - Id: e1
+          ReturnData: False
+          Label: FillMissingDataPointsWithZeroForIncomingBytes
+          Expression: FILL(m1,0)
+        - Id: e2
+          ReturnData: False
+          Label: FillMissingDataPointsWithZeroForIncomingRecords
+          Expression: FILL(m2,0)
+        - Id: e3
+          ReturnData: False
+          Label: IncomingBytesUsageFactor
+          Expression: e1/(1024*1024*60*5*s1)
+        - Id: e4
+          ReturnData: False
+          Label: IncomingRecordsUsageFactor
+          Expression: e2/(1000*60*5*s1)
+        - Id: e5
+          ReturnData: False
+          Label: IteratorAgeAdjustedFactor
+          Expression: !Sub (FILL(m3,0)/1000/60)*(${KinesisScaleDownThreshold}/s2)
+        - Id: e6
+          ReturnData: True
+          Label: MaxIncomingUsageFactor
+          Expression: MAX([e3,e4,e5])
+
+  ###############################################################################
+  #
+  # Kinesis Data Stream 02
+  #
+  ###############################################################################
+  AutoScalingStream02:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+
+  #
+  # Kinesis Data Stream 02 - Scale Up Alarm
+  #
+  AutoScalingStream02ScaleUpAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: [ AutoScalingStream02, AutoScalingSNSTopic ]
+    Properties:
+      AlarmName: !Join ['', [!Ref AutoScalingStream02, '-scale-up']]
+      AlarmDescription: 'Stream throughput has gone above the scale up threshold'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: !Ref KinesisScaleUpThreshold
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      AlarmActions: [ !Ref AutoScalingSNSTopic ]
+      Metrics:
+        - Id: s1
+          ReturnData: False
+          Label: ShardCount
+          Expression: 1
+        - Id: m1
+          ReturnData: False
+          Label: IncomingBytes
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              MetricName: IncomingBytes
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream02
+        - Id: m2
+          ReturnData: False
+          Label: IncomingRecords
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              MetricName: IncomingRecords
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream02
+        - Id: e1
+          ReturnData: False
+          Label: FillMissingDataPointsWithZeroForIncomingBytes
+          Expression: FILL(m1,0)
+        - Id: e2
+          ReturnData: False
+          Label: FillMissingDataPointsWithZeroForIncomingRecords
+          Expression: FILL(m2,0)
+        - Id: e3
+          ReturnData: False
+          Label: IncomingBytesUsageFactor
+          Expression: e1/(1024*1024*60*5*s1)
+        - Id: e4
+          ReturnData: False
+          Label: IncomingRecordsUsageFactor
+          Expression: e2/(1000*60*5*s1)
+        - Id: e5
+          ReturnData: True
+          Label: MaxIncomingUsageFactor
+          Expression: MAX([e3,e4])
+
+  #
+  # Kinesis Data Stream 02 - Scale Down Alarm
+  #
+  AutoScalingStream02ScaleDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: [ AutoScalingStream02, AutoScalingSNSTopic ]
+    Properties:
+      AlarmName: !Join ['', [!Ref AutoScalingStream02, '-scale-down']]
+      AlarmDescription: 'Stream throughput has gone below the scale down threshold'
+      ComparisonOperator: LessThanThreshold
+      Threshold: -1
+      EvaluationPeriods: 60
+      DatapointsToAlarm: 57
+      AlarmActions: [ !Ref AutoScalingSNSTopic ]
+      Metrics:
+        - Id: s1
+          ReturnData: False
+          Label: ShardCount
+          Expression: 1
+        - Id: s2
+          ReturnData: False
+          Label: IteratorAgeMinutesToBlockScaledowns
+          Expression: !Ref KinesisScaleDownMinIterAgeMins
+        - Id: m1
+          ReturnData: False
+          Label: IncomingBytes
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              MetricName: IncomingBytes
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream02
+        - Id: m2
+          ReturnData: False
+          Label: IncomingRecords
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              MetricName: IncomingRecords
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream02
+        - Id: m3
+          ReturnData: False
+          Label: GetRecords.IteratorAgeMilliseconds
+          MetricStat:
+            Stat: Maximum
+            Period: 300
+            Metric:
+              MetricName: GetRecords.IteratorAgeMilliseconds
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream02
+        - Id: e1
+          ReturnData: False
+          Label: FillMissingDataPointsWithZeroForIncomingBytes
+          Expression: FILL(m1,0)
+        - Id: e2
+          ReturnData: False
+          Label: FillMissingDataPointsWithZeroForIncomingRecords
+          Expression: FILL(m2,0)
+        - Id: e3
+          ReturnData: False
+          Label: IncomingBytesUsageFactor
+          Expression: e1/(1024*1024*60*5*s1)
+        - Id: e4
+          ReturnData: False
+          Label: IncomingRecordsUsageFactor
+          Expression: e2/(1000*60*5*s1)
+        - Id: e5
+          ReturnData: False
+          Label: IteratorAgeAdjustedFactor
+          Expression: !Sub (FILL(m3,0)/1000/60)*(${KinesisScaleDownThreshold}/s2)
+        - Id: e6
+          ReturnData: True
+          Label: MaxIncomingUsageFactor
+          Expression: MAX([e3,e4,e5])
+
+Outputs:
+  Stream01Name:
+    Description: "Kinesis stream 01 name"
+    Value: !Ref AutoScalingStream01
+  ScaleUpAlarm01:
+    Description: "Scale-up alarm name for stream 01"
+    Value: !Join ['', [!Ref AutoScalingStream01, '-scale-up']]
+  ScaleDownAlarm01:
+    Description: "Scale-down alarm name for stream 01"
+    Value: !Join ['', [!Ref AutoScalingStream01, '-scale-down']]
+
+  Stream02Name:
+    Description: "Kinesis stream 02 name"
+    Value: !Ref AutoScalingStream02
+  ScaleUpAlarm02:
+    Description: "Scale-up alarm name for stream 02"
+    Value: !Join ['', [!Ref AutoScalingStream02, '-scale-up']]
+  ScaleDownAlarm02:
+    Description: "Scale-down alarm name for stream 02"
+    Value: !Join ['', [!Ref AutoScalingStream02, '-scale-down']]
