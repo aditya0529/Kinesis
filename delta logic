@@ -1,0 +1,379 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudFormation template to deploy a Kinesis stream auto-scaling solution
+  based on the average GetRecords latency using relative scaling:
+    - For scale-up:
+        * Latency ≥ 800 ms: add 8 shards
+        * Latency ≥ 600 ms: add 6 shards
+        * Latency ≥ 400 ms: add 4 shards
+        * Latency ≥ 200 ms: add 1 shard
+    - For scale-down:
+        * If latency < 200 ms: set target to 1 shard
+        * Else if latency < 400 ms: remove 1 shard
+        * Else if latency < 600 ms: remove 4 shards
+        * Else if latency < 800 ms: remove 6 shards
+  A cooldown period (5 minutes) is enforced between scaling actions.
+
+Resources:
+  ###########################################################################
+  # Auto Scaling Lambda Function
+  ###########################################################################
+  AutoScalingLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: AutoScalingLambdaRole
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-kinesis-scaling'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AutoScalingLambdaRole.Arn
+      MemorySize: 512
+      Timeout: 900
+      Environment:
+        Variables:
+          COOLDOWN_SECONDS: "300"  # 5 minutes cooldown between scaling actions
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import logging
+          import time
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+
+          # Initialize logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Create boto3 clients
+          cloudwatch_client = boto3.client('cloudwatch')
+          kinesis_client = boto3.client('kinesis')
+
+          # Global variable to enforce cooldown (note: may not persist across cold starts)
+          last_scale_time = 0
+
+          def get_scale_up_delta(latency):
+              """
+              For scale-up, return the number of shards to add based on latency:
+                - If latency >= 800 ms, add 8 shards
+                - Else if latency >= 600 ms, add 6 shards
+                - Else if latency >= 400 ms, add 4 shards
+                - Else if latency >= 200 ms, add 1 shard
+                - Else, no addition.
+              """
+              try:
+                  if latency >= 800:
+                      delta = 8
+                  elif latency >= 600:
+                      delta = 6
+                  elif latency >= 400:
+                      delta = 4
+                  elif latency >= 200:
+                      delta = 1
+                  else:
+                      delta = 0
+                  logger.info(f"get_scale_up_delta: For latency {latency} ms, delta = {delta}")
+                  return delta
+              except Exception as e:
+                  logger.error(f"Error in get_scale_up_delta: {e}")
+                  raise
+
+          def get_scale_down_delta(latency):
+              """
+              For scale-down, return the number of shards to remove based on latency:
+                - If latency < 200 ms, force target to 1 (by returning None)
+                - Else if latency < 400 ms, remove 1 shard
+                - Else if latency < 600 ms, remove 4 shards
+                - Else if latency < 800 ms, remove 6 shards
+                - Otherwise, no removal.
+              """
+              try:
+                  if latency < 200:
+                      logger.info("get_scale_down_delta: Latency below 200 ms, force target to 1.")
+                      return None  # This will signal to set target = 1
+                  elif latency < 400:
+                      delta = 1
+                  elif latency < 600:
+                      delta = 4
+                  elif latency < 800:
+                      delta = 6
+                  else:
+                      delta = 0
+                  logger.info(f"get_scale_down_delta: For latency {latency} ms, delta = {delta}")
+                  return delta
+              except Exception as e:
+                  logger.error(f"Error in get_scale_down_delta: {e}")
+                  raise
+
+          def get_stream_name(alarm_info):
+              """
+              Extract the Kinesis stream name from the alarm's metric dimensions.
+              Expects a dimension with Name 'StreamName' on the GetRecords.Latency metric.
+              """
+              try:
+                  metrics = alarm_info.get("Trigger", {}).get("Metrics", [])
+                  for metric in metrics:
+                      if "MetricStat" in metric:
+                          m = metric["MetricStat"]["Metric"]
+                          if m.get("MetricName") == "GetRecords.Latency":
+                              for d in m.get("Dimensions", []):
+                                  if d.get("Name") == "StreamName":
+                                      stream_name = d.get("Value")
+                                      logger.info(f"get_stream_name: Found stream name: {stream_name}")
+                                      return stream_name
+              except Exception as e:
+                  logger.error(f"Error in get_stream_name: {e}")
+                  raise
+              logger.error("get_stream_name: Stream name not found in alarm info.")
+              return None
+
+          def get_latest_latency(stream_name):
+              """
+              Retrieve the latest average GetRecords latency for the specified stream over the past 5 minutes.
+              """
+              try:
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(minutes=5)
+                  metric_response = cloudwatch_client.get_metric_statistics(
+                      Namespace="AWS/Kinesis",
+                      MetricName="GetRecords.Latency",
+                      Dimensions=[{"Name": "StreamName", "Value": stream_name}],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=["Average"]
+                  )
+                  datapoints = metric_response.get("Datapoints", [])
+                  if not datapoints:
+                      logger.warning(f"get_latest_latency: No latency datapoints found for stream {stream_name}.")
+                      return None
+                  latest_dp = sorted(datapoints, key=lambda x: x["Timestamp"])[-1]
+                  latency = latest_dp["Average"]
+                  logger.info(f"get_latest_latency: Average latency for stream {stream_name} is {latency} ms")
+                  return latency
+              except Exception as e:
+                  logger.error(f"Error in get_latest_latency: {e}")
+                  raise
+
+          def update_stream_shard_count(stream_name, target_shard_count):
+              """
+              Update the shard count for the specified Kinesis stream.
+              """
+              try:
+                  kinesis_client.update_shard_count(
+                      StreamName=stream_name,
+                      TargetShardCount=target_shard_count,
+                      ScalingType='UNIFORM_SCALING'
+                  )
+                  logger.info(f"update_stream_shard_count: Shard count updated to {target_shard_count} for stream {stream_name}.")
+              except Exception as e:
+                  logger.error(f"Error in update_stream_shard_count: {e}")
+                  raise
+
+          def enforce_cooldown(cooldown_seconds):
+              """
+              Enforce a cooldown period between scaling actions.
+              Returns True if the cooldown is still active.
+              """
+              global last_scale_time
+              now = time.time()
+              if now - last_scale_time < cooldown_seconds:
+                  logger.info(f"enforce_cooldown: Cooldown active ({int(now - last_scale_time)}s since last scaling).")
+                  return True
+              return False
+
+          def lambda_handler(event, context):
+              global last_scale_time
+              try:
+                  logger.info("lambda_handler: Received event: %s", json.dumps(event))
+                  sns_record = event['Records'][0]['Sns']
+                  alarm_info = json.loads(sns_record['Message'])
+                  alarm_name = alarm_info.get("AlarmName", "")
+                  logger.info(f"lambda_handler: Alarm name: {alarm_name}")
+
+                  # Determine scaling direction from alarm name suffix.
+                  # (This is used mainly for logging; the delta mapping is absolute.)
+                  if alarm_name.endswith("-scale-up"):
+                      scale_direction = "up"
+                  elif alarm_name.endswith("-scale-down"):
+                      scale_direction = "down"
+                  else:
+                      logger.error("lambda_handler: Alarm name must end with '-scale-up' or '-scale-down'.")
+                      return
+
+                  stream_name = get_stream_name(alarm_info)
+                  if not stream_name:
+                      logger.error("lambda_handler: Stream name not found in alarm info.")
+                      return
+
+                  # Get current shard count
+                  stream_summary = kinesis_client.describe_stream_summary(StreamName=stream_name)
+                  current_shard_count = stream_summary['StreamDescriptionSummary']['OpenShardCount']
+                  logger.info(f"lambda_handler: Current shard count for stream {stream_name}: {current_shard_count}")
+
+                  # Retrieve the latest average GetRecords latency
+                  latency = get_latest_latency(stream_name)
+                  if latency is None:
+                      logger.error("lambda_handler: Unable to retrieve latency metric. Exiting.")
+                      return
+
+                  # Enforce cooldown period
+                  cooldown_seconds = int(os.environ.get("COOLDOWN_SECONDS", "300"))
+                  if enforce_cooldown(cooldown_seconds):
+                      logger.info("lambda_handler: Cooldown period active. Skipping scaling action.")
+                      return
+
+                  # Determine new target shard count based on scaling direction and measured latency
+                  if scale_direction == "up":
+                      delta = get_scale_up_delta(latency)
+                      new_target = current_shard_count + delta
+                  else:  # scale_direction == "down"
+                      delta = get_scale_down_delta(latency)
+                      if delta is None:
+                          new_target = 1
+                      else:
+                          new_target = max(1, current_shard_count - delta)
+
+                  if new_target == current_shard_count:
+                      logger.info("lambda_handler: No scaling action required; target equals current shard count.")
+                      return
+
+                  logger.info(f"lambda_handler: Scaling {scale_direction}: updating shard count from {current_shard_count} to {new_target} shards.")
+
+                  # Update the stream's shard count
+                  update_stream_shard_count(stream_name, new_target)
+                  last_scale_time = time.time()
+
+              except Exception as e:
+                  logger.error(f"lambda_handler: Error processing scaling event: {e}")
+                  raise e
+
+  ###########################################################################
+  # Auto Scaling Lambda IAM Role
+  ###########################################################################
+  AutoScalingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AllowCloudWatchAndKinesisAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:GetMetricStatistics
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:UpdateShardCount
+                Resource: "*"  # Restrict further if necessary
+        - PolicyName: AllowLoggingToCloudWatch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-kinesis-scaling:*"
+
+  ###########################################################################
+  # Kinesis Data Stream
+  ###########################################################################
+  AutoScalingStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+
+  ###########################################################################
+  # CloudWatch Alarms for Scaling
+  ###########################################################################
+  AutoScalingStreamScaleUpAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+      - AutoScalingStream
+    Properties:
+      AlarmName: !Join ['', [!Ref AutoScalingStream, '-scale-up']]
+      AlarmDescription: "Stream GetRecords latency exceeded scale-up threshold"
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 200
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      AlarmActions:
+        - !Ref AutoScalingSNSTopic
+      Metrics:
+        - Id: latency
+          ReturnData: True
+          Label: "GetRecordsLatencyAverage"
+          MetricStat:
+            Stat: Average
+            Period: 300
+            Metric:
+              MetricName: GetRecords.Latency
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream
+
+  AutoScalingStreamScaleDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+      - AutoScalingStream
+    Properties:
+      AlarmName: !Join ['', [!Ref AutoScalingStream, '-scale-down']]
+      AlarmDescription: "Stream GetRecords latency fell below scale-down threshold"
+      ComparisonOperator: LessThanThreshold
+      Threshold: 200
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      AlarmActions:
+        - !Ref AutoScalingSNSTopic
+      Metrics:
+        - Id: latency
+          ReturnData: True
+          Label: "GetRecordsLatencyAverage"
+          MetricStat:
+            Stat: Average
+            Period: 300
+            Metric:
+              MetricName: GetRecords.Latency
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream
+
+  ###########################################################################
+  # SNS Topic for Alarm Notifications
+  ###########################################################################
+  AutoScalingSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-kinesis-scaling-topic"
+
+  AutoScalingSNSTopicLambdaPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref AutoScalingLambda
+      Principal: "sns.amazonaws.com"
+      SourceArn: !Ref AutoScalingSNSTopic
+
+Outputs:
+  StreamName:
+    Description: "Kinesis stream name"
+    Value: !Ref AutoScalingStream
+  ScaleUpAlarm:
+    Description: "Scale-up alarm name"
+    Value: !Join ['', [!Ref AutoScalingStream, '-scale-up']]
+  ScaleDownAlarm:
+    Description: "Scale-down alarm name"
+    Value: !Join ['', [!Ref AutoScalingStream, '-scale-down']]
