@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudFormation template to deploy a Kinesis stream auto-scaling solution
+  based on the average GetRecords latency using fixed absolute scaling:
+    - For every 200 ms of latency, the target shard count increases by 2.
+    - If latency is below 200 ms, the target is 1 shard.
+  A cooldown period (5 minutes) is enforced between scaling actions.
+
+Resources:
+  ###########################################################################
+  # Auto Scaling Lambda Function
+  ###########################################################################
+  AutoScalingLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: AutoScalingLambdaRole
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-kinesis-scaling'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AutoScalingLambdaRole.Arn
+      MemorySize: 512
+      Timeout: 900
+      Environment:
+        Variables:
+          COOLDOWN_PERIOD_SECONDS: "300"  # 5 minutes cooldown
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import logging
+          import time
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # AWS clients
+          cloudwatch = boto3.client('cloudwatch')
+          kinesis = boto3.client('kinesis')
+
+          # Global variable to enforce cooldown (note: may not persist across cold starts)
+          last_scaling_timestamp = 0
+
+          def get_target_shard_count(latency_ms):
+              """
+              Calculate the target shard count using a fixed formula.
+              For every full 200 ms of latency, target shards = 2 * (latency // 200)
+              Minimum target is 1 shard.
+              Examples:
+                - latency < 200 ms -> target 1 shard
+                - 200 <= latency < 400 -> target 2 shards
+                - 400 <= latency < 600 -> target 4 shards
+                - 600 <= latency < 800 -> target 6 shards
+                - latency >= 800 -> target 8 shards
+              """
+              try:
+                  target = 2 * int(latency_ms / 200)
+                  if target < 1:
+                      target = 1
+                  logger.info(f"get_target_shard_count: latency_ms={latency_ms}, target_shards={target}")
+                  return target
+              except Exception as err:
+                  logger.error(f"get_target_shard_count: Error calculating target shards: {err}")
+                  raise
+
+          def extract_kinesis_stream_name(alarm_payload):
+              """
+              Extract the Kinesis stream name from the CloudWatch alarm payload.
+              It expects a metric dimension where Name is 'StreamName' on the GetRecords.Latency metric.
+              """
+              try:
+                  metrics = alarm_payload.get("Trigger", {}).get("Metrics", [])
+                  for metric in metrics:
+                      if "MetricStat" in metric:
+                          metric_info = metric["MetricStat"]["Metric"]
+                          if metric_info.get("MetricName") == "GetRecords.Latency":
+                              for dimension in metric_info.get("Dimensions", []):
+                                  if dimension.get("Name") == "StreamName":
+                                      stream_name = dimension.get("Value")
+                                      logger.info(f"extract_kinesis_stream_name: Found stream name: {stream_name}")
+                                      return stream_name
+              except Exception as err:
+                  logger.error(f"extract_kinesis_stream_name: Error extracting stream name: {err}")
+                  raise
+              logger.error("extract_kinesis_stream_name: Kinesis stream name not found in alarm payload.")
+              return None
+
+          def retrieve_latest_average_latency(stream_name):
+              """
+              Retrieve the latest average GetRecords latency for the given stream over the past 5 minutes.
+              """
+              try:
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(minutes=5)
+                  response = cloudwatch.get_metric_statistics(
+                      Namespace="AWS/Kinesis",
+                      MetricName="GetRecords.Latency",
+                      Dimensions=[{"Name": "StreamName", "Value": stream_name}],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=["Average"]
+                  )
+                  datapoints = response.get("Datapoints", [])
+                  if not datapoints:
+                      logger.warning(f"retrieve_latest_average_latency: No datapoints for stream {stream_name}.")
+                      return None
+                  latest_dp = sorted(datapoints, key=lambda x: x["Timestamp"])[-1]
+                  avg_latency = latest_dp["Average"]
+                  logger.info(f"retrieve_latest_average_latency: Average latency for stream {stream_name} is {avg_latency} ms")
+                  return avg_latency
+              except Exception as err:
+                  logger.error(f"retrieve_latest_average_latency: Error retrieving latency: {err}")
+                  raise
+
+          def update_kinesis_shard_count(stream_name, target_shard_count):
+              """
+              Update the Kinesis stream to the target shard count using uniform scaling.
+              """
+              try:
+                  kinesis.update_shard_count(
+                      StreamName=stream_name,
+                      TargetShardCount=target_shard_count,
+                      ScalingType='UNIFORM_SCALING'
+                  )
+                  logger.info(f"update_kinesis_shard_count: Updated stream {stream_name} to {target_shard_count} shards.")
+              except Exception as err:
+                  logger.error(f"update_kinesis_shard_count: Error updating shard count: {err}")
+                  raise
+
+          def is_cooldown_active(cooldown_period_seconds):
+              """
+              Check if the cooldown period is active.
+              Returns True if the time elapsed since the last scaling is less than the cooldown period.
+              """
+              global last_scaling_timestamp
+              current_time = time.time()
+              if current_time - last_scaling_timestamp < cooldown_period_seconds:
+                  logger.info(f"is_cooldown_active: Cooldown active ({int(current_time - last_scaling_timestamp)}s elapsed).")
+                  return True
+              return False
+
+          def lambda_handler(event, context):
+              global last_scaling_timestamp
+              try:
+                  logger.info("lambda_handler: Received event: %s", json.dumps(event))
+                  # Parse SNS message (CloudWatch alarm notification)
+                  sns_message = event['Records'][0]['Sns']['Message']
+                  alarm_payload = json.loads(sns_message)
+                  alarm_name = alarm_payload.get("AlarmName", "")
+                  logger.info(f"lambda_handler: Alarm name: {alarm_name}")
+
+                  # Determine scaling direction from the alarm name (used for logging)
+                  if alarm_name.endswith("-scale-up"):
+                      scaling_direction = "scale-up"
+                  elif alarm_name.endswith("-scale-down"):
+                      scaling_direction = "scale-down"
+                  else:
+                      logger.error("lambda_handler: Alarm name must end with '-scale-up' or '-scale-down'.")
+                      return
+
+                  # Extract the Kinesis stream name from the alarm payload
+                  kinesis_stream = extract_kinesis_stream_name(alarm_payload)
+                  if not kinesis_stream:
+                      logger.error("lambda_handler: Kinesis stream name not found in alarm payload.")
+                      return
+
+                  # Get current shard count
+                  stream_summary = kinesis.describe_stream_summary(StreamName=kinesis_stream)
+                  current_shard_count = stream_summary['StreamDescriptionSummary']['OpenShardCount']
+                  logger.info(f"lambda_handler: Current shard count for stream {kinesis_stream} is {current_shard_count}")
+
+                  # Retrieve the latest average latency
+                  average_latency = retrieve_latest_average_latency(kinesis_stream)
+                  if average_latency is None:
+                      logger.error("lambda_handler: Unable to retrieve latency metric. Exiting.")
+                      return
+
+                  # Enforce cooldown period
+                  cooldown_period = int(os.environ.get("COOLDOWN_PERIOD_SECONDS", "300"))
+                  if is_cooldown_active(cooldown_period):
+                      logger.info("lambda_handler: Cooldown period active. Skipping scaling action.")
+                      return
+
+                  # Calculate the target shard count using the fixed formula
+                  target_shard_count = get_target_shard_count(average_latency)
+                  if target_shard_count == current_shard_count:
+                      logger.info("lambda_handler: No scaling action required; target equals current shard count.")
+                      return
+
+                  logger.info(f"lambda_handler: Scaling action: updating shard count from {current_shard_count} to {target_shard_count} for stream {kinesis_stream}.")
+
+                  # Apply the shard count update
+                  update_kinesis_shard_count(kinesis_stream, target_shard_count)
+                  last_scaling_timestamp = time.time()
+
+              except Exception as error:
+                  logger.error(f"lambda_handler: Error processing scaling event: {error}")
+                  raise error
+
+  ###########################################################################
+  # Auto Scaling Lambda IAM Role
+  ###########################################################################
+  AutoScalingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisScalingPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:GetMetricStatistics
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:UpdateShardCount
+                Resource: "*"  # You can further restrict this if needed
+        - PolicyName: LambdaLoggingPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-kinesis-scaling:*"
+
+  ###########################################################################
+  # Kinesis Data Stream
+  ###########################################################################
+  AutoScalingStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+
+  ###########################################################################
+  # CloudWatch Alarms for Scaling
+  ###########################################################################
+  AutoScalingStreamScaleUpAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+      - AutoScalingStream
+    Properties:
+      AlarmName: !Join ['', [!Ref AutoScalingStream, '-scale-up']]
+      AlarmDescription: "Stream GetRecords latency exceeded scale-up threshold"
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 200
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      AlarmActions:
+        - !Ref AutoScalingSNSTopic
+      Metrics:
+        - Id: LatencyMetric
+          ReturnData: True
+          Label: "GetRecordsLatencyAverage"
+          MetricStat:
+            Stat: Average
+            Period: 300
+            Metric:
+              MetricName: GetRecords.Latency
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream
+
+  AutoScalingStreamScaleDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn:
+      - AutoScalingStream
+    Properties:
+      AlarmName: !Join ['', [!Ref AutoScalingStream, '-scale-down']]
+      AlarmDescription: "Stream GetRecords latency fell below scale-down threshold"
+      ComparisonOperator: LessThanThreshold
+      Threshold: 200
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      AlarmActions:
+        - !Ref AutoScalingSNSTopic
+      Metrics:
+        - Id: LatencyMetric
+          ReturnData: True
+          Label: "GetRecordsLatencyAverage"
+          MetricStat:
+            Stat: Average
+            Period: 300
+            Metric:
+              MetricName: GetRecords.Latency
+              Namespace: AWS/Kinesis
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref AutoScalingStream
+
+  ###########################################################################
+  # SNS Topic for Alarm Notifications
+  ###########################################################################
+  AutoScalingSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-kinesis-scaling-topic"
+
+  AutoScalingSNSTopicLambdaPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref AutoScalingLambda
+      Principal: "sns.amazonaws.com"
+      SourceArn: !Ref AutoScalingSNSTopic
+
+Outputs:
+  StreamName:
+    Description: "Kinesis stream name"
+    Value: !Ref AutoScalingStream
+  ScaleUpAlarm:
+    Description: "Scale-up alarm name"
+    Value: !Join ['', [!Ref AutoScalingStream, '-scale-up']]
+  ScaleDownAlarm:
+    Description: "Scale-down alarm name"
+    Value: !Join ['', [!Ref AutoScalingStream, '-scale-down']]
