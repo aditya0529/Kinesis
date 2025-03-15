@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template for an EC2 instance acting as a Kinesis consumer.
+  This instance injects artificial network delay (using tc) on its network interface
+  to simulate increased GetRecords API latency for testing auto-scaling scenarios.
+  The instance consumes records from a specified Kinesis stream and logs output to CloudWatch Logs.
+  The Python consumer script explicitly retrieves the region using boto3.session.Session().
+
+Parameters:
+  KeyName:
+    Description: "Name of an existing EC2 KeyPair to enable SSH access to the instance."
+    Type: AWS::EC2::KeyPair::KeyName
+  InstanceType:
+    Description: "EC2 instance type"
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+  StreamName:
+    Description: "Name of the existing Kinesis Data Stream to consume from."
+    Type: String
+    Default: MyDataStream
+  NetworkDelayMs:
+    Description: "Network delay to inject on the EC2 instance (in milliseconds)."
+    Type: Number
+    Default: 300
+
+Resources:
+  #############################################
+  # CloudWatch Log Group for Consumer Logs
+  #############################################
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "EC2ConsumerLogGroup"
+      RetentionInDays: 7
+
+  #############################################
+  # IAM Role for the EC2 Consumer Instance
+  #############################################
+  EC2ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: "KinesisConsumerPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:ListShards
+                Resource: !Sub "arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${StreamName}"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:EC2ConsumerLogGroup:*"
+
+  #############################################
+  # Instance Profile for the EC2 Consumer Role
+  #############################################
+  EC2ConsumerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2ConsumerRole
+      Path: "/"
+
+  #############################################
+  # Security Group for the EC2 Instance
+  #############################################
+  EC2ConsumerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow SSH access"
+      VpcId: vpc-0e88f20e26938ab8c  # Replace with your actual VPC ID or parameterize it
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  #############################################
+  # EC2 Instance for Kinesis Consumer with tc delay injection
+  #############################################
+  EC2ConsumerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: ami-0c94855ba95c71c99  # Amazon Linux 2 AMI; update if needed.
+      IamInstanceProfile: !Ref EC2ConsumerInstanceProfile
+      SecurityGroupIds:
+        - !Ref EC2ConsumerSecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -e
+              echo "Starting EC2 Consumer Instance Setup"
+
+              # Update packages and install required software
+              yum update -y
+              yum install -y python3 iproute-tc amazon-cloudwatch-agent
+
+              # Install Python packages
+              pip3 install boto3
+
+              # Inject artificial network delay using tc on eth0.
+              echo "Injecting network delay of ${NetworkDelayMs} ms on eth0"
+              tc qdisc add dev eth0 root netem delay ${NetworkDelayMs}ms
+
+              # Create CloudWatch Agent configuration file for consumer logs
+              cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+              {
+                "logs": {
+                  "logs_collected": {
+                    "files": {
+                      "collect_list": [
+                        {
+                          "file_path": "/var/log/consumer.log",
+                          "log_group_name": "EC2ConsumerLogGroup",
+                          "log_stream_name": "{instance_id}",
+                          "timezone": "UTC"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+              EOF
+
+              # Start CloudWatch Agent using the configuration file
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+              # Write a Python consumer script (compatible with Python 3.12) to poll the Kinesis stream
+              cat > /home/ec2-user/kinesis_consumer.py << 'EOF'
+              #!/usr/bin/env python3
+              import boto3
+              import time
+              import logging
+
+              # Configure logging
+              logging.basicConfig(level=logging.INFO)
+              logger = logging.getLogger("KinesisConsumer")
+
+              STREAM_NAME = "${StreamName}"
+              POLL_INTERVAL_SECONDS = 5  # adjust to simulate different consumption speeds
+
+              # Create a boto3 session to automatically retrieve the region
+              session = boto3.session.Session()
+              region = session.region_name or "us-east-1"
+              logger.info(f"Using region: {region}")
+
+              kinesis_client = boto3.client("kinesis", region_name=region)
+
+              def get_shard_iterator(stream_name, shard_id):
+                  response = kinesis_client.get_shard_iterator(
+                      StreamName=stream_name,
+                      ShardId=shard_id,
+                      ShardIteratorType="LATEST"
+                  )
+                  return response["ShardIterator"]
+
+              def consume_stream():
+                  response = kinesis_client.describe_stream(StreamName=STREAM_NAME)
+                  shards = response["StreamDescription"]["Shards"]
+                  shard_iterators = {}
+                  for shard in shards:
+                      shard_id = shard["ShardId"]
+                      shard_iterators[shard_id] = get_shard_iterator(STREAM_NAME, shard_id)
+                  
+                  while True:
+                      for shard_id, iterator in list(shard_iterators.items()):
+                          if not iterator:
+                              continue
+                          response = kinesis_client.get_records(ShardIterator=iterator, Limit=100)
+                          records = response.get("Records", [])
+                          if records:
+                              logger.info(f"Shard {shard_id}: Received {len(records)} records")
+                          shard_iterators[shard_id] = response.get("NextShardIterator")
+                      time.sleep(POLL_INTERVAL_SECONDS)
+
+              if __name__ == "__main__":
+                  logger.info("Starting Kinesis consumer at " + time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+                  consume_stream()
+              EOF
+
+              chmod +x /home/ec2-user/kinesis_consumer.py
+
+              # Start the consumer script in the background and redirect output to /var/log/consumer.log
+              nohup python3 /home/ec2-user/kinesis_consumer.py > /var/log/consumer.log 2>&1 &
+              echo "EC2 Consumer Instance Setup Complete"
+            - { NetworkDelayMs: !Ref NetworkDelayMs, StreamName: !Ref StreamName }
+
+Outputs:
+  ConsumerInstanceId:
+    Description: "ID of the consumer EC2 instance"
+    Value: !Ref EC2ConsumerInstance
+  ConsumerLogGroupName:
+    Description: "CloudWatch Log Group for consumer logs"
+    Value: !Ref ConsumerLogGroup
