@@ -1,6 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: |
-  CloudFormation template to deploy an EC2 instance that continuously generates sample CloudTrail API log entries (in JSON format) and pushes them to a CloudWatch Logs group. The CloudWatch Agent is installed on the instance to push logs from /var/log/dummy.log. The log group is named "DummyLogGroup" with a retention period of 14 days.
+  CloudFormation template to deploy an EC2 instance that continuously generates 
+  and pushes 10,000 CloudTrail-like API log entries per second to CloudWatch Logs.
 
 Parameters:
   KeyName:
@@ -9,11 +10,11 @@ Parameters:
   InstanceType:
     Description: EC2 instance type
     Type: String
-    Default: t2.micro
+    Default: t3.large  # Upgraded instance type for higher performance
     AllowedValues:
-      - t2.micro
-      - t2.small
-      - t2.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
 
 Resources:
   DummyLogGroup:
@@ -58,16 +59,18 @@ Resources:
     Properties:
       InstanceType: !Ref InstanceType
       KeyName: !Ref KeyName
-      ImageId: ami-0c94855ba95c71c99 # Amazon Linux 2 AMI in us-east-1 (update if necessary)
+      ImageId: ami-0c94855ba95c71c99  # Amazon Linux 2 AMI in us-east-1
       IamInstanceProfile: !Ref EC2InstanceProfile
       UserData: !Base64
         Fn::Sub: |
           #!/bin/bash
-          # Update system and install CloudWatch Agent
-          yum update -y
-          yum install -y amazon-cloudwatch-agent
+          set -e
 
-          # Create CloudWatch Agent configuration file to collect logs from /var/log/dummy.log
+          # Update system and install required packages
+          yum update -y
+          yum install -y amazon-cloudwatch-agent jq
+
+          # Configure CloudWatch Agent to collect logs from /var/log/dummy.log
           cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
           {
               "logs": {
@@ -87,73 +90,78 @@ Resources:
           }
           EOF
 
-          # Start CloudWatch Agent using the configuration file
+          # Start CloudWatch Agent
           /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
             -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
 
-          # Generate sample CloudTrail-like logs continuously in background.
-          echo "Starting CloudTrail log generation..."
+          # Optimize log generation
+          echo "Starting high-speed CloudTrail log generation..."
+
+          # Generate 10,000 log entries per second
+          nohup bash -c '
           while true; do
-            dummy_event_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            # The $$ escapes the bash variable so CloudFormation doesn't substitute it.
-            echo "{
-              \"eventVersion\": \"1.08\",
-              \"userIdentity\": {
-                \"type\": \"IAMUser\",
-                \"principalId\": \"EXAMPLEPRINCIPALID\",
-                \"arn\": \"arn:aws:iam::123456789012:user/Alice\",
-                \"accountId\": \"123456789012\",
-                \"accessKeyId\": \"EXAMPLEACCESSKEYID\",
-                \"userName\": \"Alice\"
-              },
-              \"eventTime\": \"$$dummy_event_time\",
-              \"eventSource\": \"ec2.amazonaws.com\",
-              \"eventName\": \"StartInstances\",
-              \"awsRegion\": \"us-east-1\",
-              \"sourceIPAddress\": \"192.0.2.0\",
-              \"userAgent\": \"aws-cli/1.18.69\",
-              \"requestParameters\": {
-                \"instancesSet\": {
-                  \"items\": [
-                    {
-                      \"instanceId\": \"i-1234567890abcdef0\"
-                    }
-                  ]
-                }
-              },
-              \"responseElements\": {
-                \"instancesSet\": {
-                  \"items\": [
-                    {
-                      \"instanceId\": \"i-1234567890abcdef0\",
-                      \"currentState\": {
-                        \"code\": 0,
-                        \"name\": \"pending\"
-                      },
-                      \"previousState\": {
-                        \"code\": 80,
-                        \"name\": \"stopped\"
-                      }
-                    }
-                  ]
-                }
-              },
-              \"requestID\": \"req-$$(date +%s)\",
-              \"eventID\": \"evt-$$(date +%s)\",
-              \"readOnly\": false,
-              \"resources\": [
-                {
-                  \"ARN\": \"arn:aws:ec2:us-east-1:123456789012:instance/i-1234567890abcdef0\",
+            timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            for i in {1..10000}; do
+              echo "{
+                \"eventVersion\": \"1.08\",
+                \"userIdentity\": {
+                  \"type\": \"IAMUser\",
+                  \"principalId\": \"EXAMPLEPRINCIPALID\",
+                  \"arn\": \"arn:aws:iam::123456789012:user/Alice\",
                   \"accountId\": \"123456789012\",
-                  \"type\": \"AWS::EC2::Instance\"
-                }
-              ],
-              \"eventType\": \"AwsApiCall\",
-              \"managementEvent\": true,
-              \"recipientAccountId\": \"123456789012\"
-            }" >> /var/log/dummy.log
+                  \"accessKeyId\": \"EXAMPLEACCESSKEYID\",
+                  \"userName\": \"Alice\"
+                },
+                \"eventTime\": \"$timestamp\",
+                \"eventSource\": \"ec2.amazonaws.com\",
+                \"eventName\": \"StartInstances\",
+                \"awsRegion\": \"us-east-1\",
+                \"sourceIPAddress\": \"192.0.2.0\",
+                \"userAgent\": \"aws-cli/1.18.69\",
+                \"requestParameters\": {
+                  \"instancesSet\": {
+                    \"items\": [
+                      {
+                        \"instanceId\": \"i-1234567890abcdef0\"
+                      }
+                    ]
+                  }
+                },
+                \"responseElements\": {
+                  \"instancesSet\": {
+                    \"items\": [
+                      {
+                        \"instanceId\": \"i-1234567890abcdef0\",
+                        \"currentState\": {
+                          \"code\": 0,
+                          \"name\": \"pending\"
+                        },
+                        \"previousState\": {
+                          \"code\": 80,
+                          \"name\": \"stopped\"
+                        }
+                      }
+                    ]
+                  }
+                },
+                \"requestID\": \"req-$(date +%s)-$i\",
+                \"eventID\": \"evt-$(date +%s)-$i\",
+                \"readOnly\": false,
+                \"resources\": [
+                  {
+                    \"ARN\": \"arn:aws:ec2:us-east-1:123456789012:instance/i-1234567890abcdef0\",
+                    \"accountId\": \"123456789012\",
+                    \"type\": \"AWS::EC2::Instance\"
+                  }
+                ],
+                \"eventType\": \"AwsApiCall\",
+                \"managementEvent\": true,
+                \"recipientAccountId\": \"123456789012\"
+              }" >> /var/log/dummy.log
+            done
             sleep 1
-          done &
+          done
+          ' &
 
 Outputs:
   InstanceId:
