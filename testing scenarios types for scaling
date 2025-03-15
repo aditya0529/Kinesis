@@ -1,0 +1,62 @@
+1. Invoke the Lambda with a Test Event
+You can simulate a CloudWatch alarm SNS message directly by creating test event payloads that mimic the alarm notifications. For example, in the Lambda console you can use these sample payloads:
+
+Scale-Up Test Event:
+
+json
+Copy
+{
+  "Records": [
+    {
+      "Sns": {
+        "Message": "{\"AlarmName\": \"MyDataStream-scale-up\", \"NewStateValue\": \"ALARM\", \"NewStateReason\": \"Test scale-up event\"}"
+      }
+    }
+  ]
+}
+Scale-Down Test Event:
+
+json
+Copy
+{
+  "Records": [
+    {
+      "Sns": {
+        "Message": "{\"AlarmName\": \"MyDataStream-scale-down\", \"NewStateValue\": \"ALARM\", \"NewStateReason\": \"Test scale-down event\"}"
+      }
+    }
+  ]
+}
+You can invoke the Lambda manually using these events. When testing, check your CloudWatch Logs for your Lambda function to verify that:
+
+It parses the event correctly.
+It reads the current shard count.
+It retrieves the latency and calculates the desired shard count.
+It calls the Kinesis API to update the shard count if needed.
+2. Simulate Metric Data with CloudWatch PutMetricData
+Another method is to inject synthetic metric data that forces your CloudWatch alarms to trigger. For example, if you want to test scale-up, you can use the AWS CLI to publish a high latency value:
+
+bash
+Copy
+aws cloudwatch put-metric-data --namespace AWS/Kinesis --metric-data '[{"MetricName": "GetRecords.Latency", "Dimensions": [{"Name": "StreamName", "Value": "MyDataStream"}], "Value": 850, "Unit": "Milliseconds"}]'
+This command sends a metric datapoint of 850 ms for your stream. If your scale-up alarm is configured with a threshold of 200 ms, it should trigger (after your evaluation period), sending an SNS message that invokes your Lambda function.
+
+Similarly, to test scale-down, you can push a low latency value (e.g., 150 ms):
+
+bash
+Copy
+aws cloudwatch put-metric-data --namespace AWS/Kinesis --metric-data '[{"MetricName": "GetRecords.Latency", "Dimensions": [{"Name": "StreamName", "Value": "MyDataStream"}], "Value": 150, "Unit": "Milliseconds"}]'
+After publishing these metric values, monitor:
+
+The CloudWatch alarm state.
+The SNS notifications.
+The Lambda function logs.
+The actual shard count in the Kinesis console.
+3. End-to-End Testing by Adjusting Consumption
+You can also test in an end-to-end scenario by adjusting your consumer’s behavior. For example, if you slow down the consumer processing, the GetRecords.Latency metric will naturally increase (because consumers take longer to process records), triggering scale-up. Conversely, if you speed up the consumer, latency should drop, and the scale-down alarm should eventually trigger.
+
+Summary
+Manual Lambda Invocation: Use the test events provided above in the Lambda console.
+Metric Injection: Use the aws cloudwatch put-metric-data command to simulate high or low latency conditions.
+End-to-End Testing: Modify your consumer behavior to naturally affect the latency metric.
+In all cases, ensure you check the CloudWatch Logs for the Lambda function and monitor the Kinesis stream’s shard count to verify the scaling actions are executed as expected.
