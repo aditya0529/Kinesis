@@ -1,0 +1,471 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Example CloudFormation template that sets up Kinesis stream auto-scaling 
+  based on GetRecords.Latency. Demonstrates non-conflicting alarms with 
+  distinct metric-math conditions, an SNS topic, and a Lambda function 
+  to do the scaling. Includes cooldown, logging, error handling, and 
+  scale constraints (no more than 2x on scale-up, no more than 50% 
+  reduction on scale-down, with iteration + sleeps if needed).
+
+Parameters:
+  StreamName:
+    Type: String
+    Default: MyKinesisStream
+    Description: Name of the Kinesis Stream
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda function timeout in seconds
+
+  LambdaMemory:
+    Type: Number
+    Default: 256
+    Description: Lambda function memory size in MB
+
+  CooldownEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "Enable or disable cooldown logic"
+
+  CooldownSeconds:
+    Type: Number
+    Default: 300
+    Description: "Cooldown period in seconds (only used if CooldownEnabled is true)"
+
+Resources:
+
+  ########################################
+  # 1) Kinesis Stream (Example)
+  ########################################
+  MyKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Ref StreamName
+      ShardCount: 1   # Start with 1 shard as requested
+      RetentionPeriodHours: 24
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+
+  ########################################
+  # 2) SNS Topic + Subscription to Lambda
+  ########################################
+  AutoScalingSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: KinesisAutoScalingTopic
+
+  ########################################
+  # 3) Lambda IAM Role
+  ########################################
+  KinesisScalingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonKinesisFullAccess
+      # For a more restrictive approach, you could attach a custom policy
+      # that only allows describing & updating the specific stream.
+
+  ########################################
+  # 4) Lambda Function
+  ########################################
+  KinesisScalingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt KinesisScalingLambdaRole.Arn
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemory
+      Environment:
+        Variables:
+          STREAM_NAME: !Ref StreamName
+          COOLDOWN_ENABLED: !Ref CooldownEnabled
+          COOLDOWN_SECONDS: !Ref CooldownSeconds
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import time
+          import math
+          import logging
+          import boto3
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          KINESIS_CLIENT = boto3.client('kinesis')
+
+          # Global variable to track last scale time (non-persistent).
+          LAST_SCALE_TIME = 0
+
+          STREAM_NAME = os.environ['STREAM_NAME']
+
+          def lambda_handler(event, context):
+              """
+              Receives an SNS event with a CloudWatch Alarm notification. 
+              Each Alarm corresponds to a latency range => target shard count (1,2,4,6,8).
+
+              We have constraints:
+                - Scale up no more than 2x the current shard count per operation.
+                - Scale down no more than 50% reduction (i.e., must keep at least half).
+
+              If a large jump is required (e.g., current=2 -> desired=8),
+              we iterate multiple calls: 2->4, sleep, 4->8, etc.
+
+              We also have optional cooldown:
+                - If COOLDOWN_ENABLED="true" and we haven't waited 
+                  COOLDOWN_SECONDS since the last scale, we skip scaling.
+              """
+              global LAST_SCALE_TIME
+
+              logger.info("Lambda handler invoked. Processing SNS event records.")
+
+              # Check cooldown
+              cooldown_enabled = os.environ.get('COOLDOWN_ENABLED', 'false').lower() == 'true'
+              cooldown_seconds = int(os.environ.get('COOLDOWN_SECONDS', '300'))
+              now = time.time()
+
+              # If cooldown is active and time since last scale < cooldown_seconds, skip
+              if cooldown_enabled and (now - LAST_SCALE_TIME < cooldown_seconds):
+                  logger.info(
+                      f"Cooldown active. Last scale was {int(now - LAST_SCALE_TIME)}s ago; "
+                      f"cooldown is {cooldown_seconds}s. Skipping scaling."
+                  )
+                  return
+
+              # Process each SNS record
+              for record in event['Records']:
+                  sns_message = record['Sns']['Message']
+                  logger.info(f"Received raw SNS message: {sns_message}")
+
+                  # Delegate to a helper method for parsing and scaling
+                  process_sns_message(sns_message)
+
+              # If we did a scale in any record, update LAST_SCALE_TIME at the end
+              # However, note that we only do so if a scale actually occurred in process_sns_message.
+              # For simplicity, let's set it if ANY scale has happened within the iteration
+              # (the method sets a global or returns a boolean). We'll do a simpler approach:
+              # We'll rely on the global variable updated by scale_to_target. 
+              # (No changes to logic, only logging improvements.)
+              logger.info("Completed processing of SNS event.")
+
+
+          def process_sns_message(sns_message):
+              """
+              Parse the SNS message for the alarm name, determine desired shards,
+              and perform scaling if needed.
+              """
+              global LAST_SCALE_TIME
+
+              alarm_name = None
+              try:
+                  alarm_payload = json.loads(sns_message)
+                  alarm_name = alarm_payload.get('AlarmName', 'UnknownAlarm')
+                  logger.info(f"Parsed alarm name from SNS message: {alarm_name}")
+              except Exception as e:
+                  logger.warning(f"Could not parse SNS message as JSON. Error: {e}")
+                  alarm_name = sns_message
+
+              desired_shards = get_desired_shards_from_alarm(alarm_name)
+              if desired_shards is not None:
+                  try:
+                      current_shards = get_current_shard_count(STREAM_NAME)
+                      if current_shards != desired_shards:
+                          logger.info(
+                              f"Alarm {alarm_name} triggered. Need to scale "
+                              f"{STREAM_NAME} from {current_shards} -> {desired_shards} shards."
+                          )
+                          scale_to_target(STREAM_NAME, current_shards, desired_shards)
+                          # Update last scale time once scaling is done
+                          LAST_SCALE_TIME = time.time()
+                      else:
+                          logger.info(
+                              f"Alarm {alarm_name} triggered, but already at desired "
+                              f"{desired_shards} shards. No update needed."
+                          )
+                  except Exception as ex:
+                      logger.error(f"Error during scaling operation: {ex}", exc_info=True)
+              else:
+                  logger.info(
+                      f"Alarm {alarm_name} triggered, but ignoring since it doesn't map to known range."
+                  )
+
+
+          def get_desired_shards_from_alarm(alarm_name):
+              """
+              Map alarm names to desired shard counts based on naming scheme.
+              """
+              if "Range1" in alarm_name:
+                  return 1
+              elif "Range2" in alarm_name:
+                  return 2
+              elif "Range4" in alarm_name:
+                  return 4
+              elif "Range6" in alarm_name:
+                  return 6
+              elif "Range8" in alarm_name:
+                  return 8
+              return None
+
+
+          def get_current_shard_count(stream_name):
+              """Return the current shard count by describing the stream."""
+              try:
+                  resp = KINESIS_CLIENT.describe_stream_summary(StreamName=stream_name)
+                  return resp['StreamDescriptionSummary']['OpenShardCount']
+              except Exception as e:
+                  logger.error(f"Failed to describe stream summary: {e}", exc_info=True)
+                  raise
+
+
+          def scale_to_target(stream_name, current_shards, desired_shards):
+              """
+              Scale from current_shards to desired_shards, respecting constraints:
+                - Scale up: no more than 2x each step
+                - Scale down: no more than 50% reduction each step
+              We call update_shards multiple times if needed, with a 5-second pause between steps.
+              """
+
+              logger.info(f"Starting iterative scaling from {current_shards} -> {desired_shards}.")
+
+              while current_shards != desired_shards:
+                  if desired_shards > current_shards:
+                      # Scale up
+                      max_allowed = current_shards * 2
+                      next_step = min(max_allowed, desired_shards)
+                      logger.info(f"Scaling up from {current_shards} to {next_step} (limit 2x).")
+                  else:
+                      # Scale down
+                      min_allowed = math.ceil(current_shards / 2)
+                      next_step = max(min_allowed, desired_shards)
+                      logger.info(f"Scaling down from {current_shards} to {next_step} (limit 50% reduction).")
+
+                  if next_step == current_shards:
+                      logger.info("No further scaling step is possible under constraints.")
+                      break
+
+                  update_shards(stream_name, next_step)
+                  current_shards = next_step
+
+                  # If we haven't reached the final desired, sleep 5 seconds before next step
+                  if current_shards != desired_shards:
+                      logger.info("Sleeping 5 seconds before next scale iteration...")
+                      time.sleep(5)
+
+              logger.info(f"Finished iterative scaling. Final shard count: {current_shards}.")
+
+
+          def update_shards(stream_name, target_count):
+              """Call UpdateShardCount to set the exact shard count."""
+              logger.info(f"Invoking UpdateShardCount: stream={stream_name}, shards={target_count}")
+              try:
+                  resp = KINESIS_CLIENT.update_shard_count(
+                      StreamName=stream_name,
+                      TargetShardCount=target_count,
+                      ScalingType='UNIFORM_SCALING'
+                  )
+                  logger.info(f"UpdateShardCount response: {resp}")
+              except Exception as e:
+                  logger.error(f"Failed to update shard count: {e}", exc_info=True)
+                  raise
+
+  ########################################
+  # 5) Lambda Permission for SNS
+  ########################################
+  KinesisScalingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt KinesisScalingLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AutoScalingSNSTopic
+
+  ########################################
+  # 6) SNS Subscription
+  ########################################
+  KinesisScalingTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt KinesisScalingLambda.Arn
+      Protocol: lambda
+      TopicArn: !Ref AutoScalingSNSTopic
+
+  ########################################
+  # 7) CloudWatch Alarms (Non-Conflicting)
+  #
+  # We keep the same metric math approach using Metrics array, 
+  # so only one alarm can be in ALARM at once.
+  #
+  # Threshold ranges:
+  #   Range1: Latency < 20 -> 1 shard
+  #   Range2: 20 <= Latency < 40 -> 2
+  #   Range4: 40 <= Latency < 60 -> 4
+  #   Range6: 60 <= Latency < 80 -> 6
+  #   Range8: Latency >= 80 -> 8
+
+  AlarmRange1:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StreamName}-LatencyRange1-Under20"
+      AlarmDescription: "Latency < 20 ms => scale to 1 shard"
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          MetricStat:
+            Metric:
+              Namespace: AWS/Kinesis
+              MetricName: GetRecords.Latency
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref StreamName
+            Period: 300
+            Stat: Average
+        - Id: range1
+          Expression: "IF(m1 < 20, 1, 0)"
+          Label: "range1-latency<20"
+          ReturnData: True
+      AlarmActions:
+        - !Ref AutoScalingSNSTopic
+
+  AlarmRange2:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StreamName}-LatencyRange2-20-40"
+      AlarmDescription: "20 <= Latency < 40 => scale to 2 shards"
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          MetricStat:
+            Metric:
+              Namespace: AWS/Kinesis
+              MetricName: GetRecords.Latency
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref StreamName
+            Period: 300
+            Stat: Average
+        - Id: range2
+          Expression: "IF((m1 >= 20) AND (m1 < 40), 1, 0)"
+          Label: "range2-20<=lat<40"
+          ReturnData: True
+      AlarmActions:
+        - !Ref AutoScalingSNSTopic
+
+  AlarmRange4:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StreamName}-LatencyRange4-40-60"
+      AlarmDescription: "40 <= Latency < 60 => scale to 4 shards"
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          MetricStat:
+            Metric:
+              Namespace: AWS/Kinesis
+              MetricName: GetRecords.Latency
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref StreamName
+            Period: 300
+            Stat: Average
+        - Id: range4
+          Expression: "IF((m1 >= 40) AND (m1 < 60), 1, 0)"
+          Label: "range4-40<=lat<60"
+          ReturnData: True
+      AlarmActions:
+        - !Ref AutoScalingSNSTopic
+
+  AlarmRange6:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StreamName}-LatencyRange6-60-80"
+      AlarmDescription: "60 <= Latency < 80 => scale to 6 shards"
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          MetricStat:
+            Metric:
+              Namespace: AWS/Kinesis
+              MetricName: GetRecords.Latency
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref StreamName
+            Period: 300
+            Stat: Average
+        - Id: range6
+          Expression: "IF((m1 >= 60) AND (m1 < 80), 1, 0)"
+          Label: "range6-60<=lat<80"
+          ReturnData: True
+      AlarmActions:
+        - !Ref AutoScalingSNSTopic
+
+  AlarmRange8:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StreamName}-LatencyRange8-80Plus"
+      AlarmDescription: "Latency >= 80 => scale to 8 shards"
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          MetricStat:
+            Metric:
+              Namespace: AWS/Kinesis
+              MetricName: GetRecords.Latency
+              Dimensions:
+                - Name: StreamName
+                  Value: !Ref StreamName
+            Period: 300
+            Stat: Average
+        - Id: range8
+          Expression: "IF(m1 >= 80, 1, 0)"
+          Label: "range8-lat>=80"
+          ReturnData: True
+      AlarmActions:
+        - !Ref AutoScalingSNSTopic
+
+Outputs:
+  KinesisStreamName:
+    Description: Name of the Kinesis Stream
+    Value: !Ref MyKinesisStream
+
+  ScalingLambdaName:
+    Description: "Lambda function name for Kinesis scaling"
+    Value: !GetAtt KinesisScalingLambda.Arn
+
+  ScalingSNSTopicArn:
+    Description: "SNS topic for Kinesis scaling alarms"
+    Value: !Ref AutoScalingSNSTopic
