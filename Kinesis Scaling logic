@@ -1,0 +1,110 @@
+1. Initial State: 2 Shards
+Let’s say we start with 2 shards: Shard A and Shard B.
+
+Shard A covers key range [0–5000].
+Shard B covers key range [5001–9999].
+mathematica
+Copy
+STREAM
+ ├── Shard A (Open)
+ │      Key Range: 0–5000
+ │      Data: [ D1, D2, D3, ... ]
+ │
+ └── Shard B (Open)
+        Key Range: 5001–9999
+        Data: [ D4, D5, ... ]
+Reading and Writing
+Producers write new records:
+If a record’s partition key hashes into [0–5000], it goes to Shard A.
+If the partition key hashes into [5001–9999], it goes to Shard B.
+Consumers read from both shards.
+2. Scale-Up (Splitting a Shard)
+Suppose we notice Shard A is heavily loaded and want to increase overall capacity by adding a new shard. Kinesis does this by splitting one open shard into two open shards.
+
+Example: Split Shard A
+We split Shard A’s key range into:
+Shard C covering [0–2500]
+Shard D covering [2501–5000]
+Once the split is triggered:
+
+Shard A transitions to CLOSED (no new writes).
+Shard C and Shard D become OPEN for new data.
+Any existing data in Shard A is still readable until it ages out, but it’s no longer receiving new records.
+mathematica
+Copy
+STREAM
+ ├── Shard A (Closed)
+ │      Key Range: 0–5000
+ │      Data: [ D1, D2, D3, ... ]  <-- still readable!
+ │
+ ├── Shard C (Open)
+ │      Key Range: 0–2500
+ │      Data: [] (initially empty)
+ │
+ ├── Shard D (Open)
+ │      Key Range: 2501–5000
+ │      Data: [] (initially empty)
+ │
+ └── Shard B (Open)
+        Key Range: 5001–9999
+        Data: [ D4, D5, ... ]
+New Writes After the Split
+Any new record with a partition key hashing to [0–2500] now goes to Shard C.
+Any new record hashing to [2501–5000] goes to Shard D.
+Keys [5001–9999] still go to Shard B.
+Result:
+
+We went from 2 shards total to 3 shards (B, C, D are open).
+Shard A has been “closed”, but data inside A can still be read until it expires (retention).
+3. Scale-Down (Merging Shards)
+Now imagine we want to reduce the shard count (perhaps we have less traffic). We can merge two adjacent shards (i.e., shards whose key ranges are consecutive).
+
+Example: Merge Shard C and Shard D
+We combine their key ranges [0–2500] and [2501–5000] into a new shard, say Shard E with [0–5000].
+Once the merge is triggered:
+
+Shard C and Shard D transition to CLOSED.
+Shard E becomes OPEN, covering [0–5000].
+Old data in C and D remains accessible (readable) until it expires, but no new records go there.
+mathematica
+Copy
+STREAM
+ ├── Shard A (Closed)
+ │      Key Range: 0–5000
+ │      Data: [ older data ] (readable until it ages out)
+ │
+ ├── Shard C (Closed)
+ │      Key Range: 0–2500
+ │      Data: [ some data ] (still readable)
+ │
+ ├── Shard D (Closed)
+ │      Key Range: 2501–5000
+ │      Data: [ some data ] (still readable)
+ │
+ ├── Shard E (Open)
+ │      Key Range: 0–5000
+ │      Data: [] (initially empty, new writes go here)
+ │
+ └── Shard B (Open)
+        Key Range: 5001–9999
+        Data: [ ... ]
+New Writes After the Merge
+Any new record with partition key [0–5000] goes to Shard E.
+Keys [5001–9999] still go to Shard B.
+Result:
+
+We reduced the total shard count from 3 open shards (B, C, D) to 2 open shards (B, E).
+C and D are now “closed” but can be read from until data expires.
+4. Key Takeaways
+Data in Closed Shards is Not Lost:
+
+It’s still readable until it expires by stream retention rules (default 24 hours, can be up to 365 days if configured).
+No new records will go into a closed shard.
+New Shards Carry the “Open” Key Ranges:
+
+Splits produce multiple new shards covering sub-ranges of the old shard’s key range.
+Merges produce a single new shard covering the combined key range of two old shards.
+Reading and Writing Moves to the New Shards:
+
+Producers automatically send new records to whichever shard covers the partition key’s hash range.
+Consumers using the Kinesis Client Library (KCL) or Lambda event source mapping automatically detect and read from new shards.
