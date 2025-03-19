@@ -7,6 +7,7 @@ Description: >
     - Checking Kinesis stream ACTIVE status before scaling.
     - Additional try/except error handling.
     - Non-conflicting alarms, each requiring 3 consecutive data points above threshold.
+    - Enforces a minimum of 1 shard (never scales below 1).
 
 Parameters:
   StreamName:
@@ -160,18 +161,24 @@ Resources:
           def get_desired_shards_from_alarm(alarm_name):
               """
               Based on the alarm name, return a target shard count.
+              Then enforce a minimum of 1 shard.
               """
               if "Range1" in alarm_name:
-                  return 1
+                  desired_shards = 1
               elif "Range2" in alarm_name:
-                  return 2
+                  desired_shards = 2
               elif "Range4" in alarm_name:
-                  return 4
+                  desired_shards = 4
               elif "Range6" in alarm_name:
-                  return 6
+                  desired_shards = 6
               elif "Range8" in alarm_name:
-                  return 8
-              return None
+                  desired_shards = 8
+              else:
+                  return None
+
+              # Enforce at least 1 shard (Kinesis cannot have 0)
+              desired_shards = max(1, desired_shards)
+              return desired_shards
 
 
           def get_current_shard_count(stream_name):
