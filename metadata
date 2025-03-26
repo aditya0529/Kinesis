@@ -1,0 +1,193 @@
+import json
+import boto3
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Cache for account names to avoid redundant Organizations calls.
+account_name_cache = {}
+org_client = boto3.client('organizations')
+
+def get_account_name(account_id):
+    """Retrieve account name using AWS Organizations (with caching)."""
+    if account_id in account_name_cache:
+        return account_name_cache[account_id]
+    try:
+        response = org_client.describe_account(AccountId=account_id)
+        account_name = response['Account']['Name']
+        account_name_cache[account_id] = account_name
+        return account_name
+    except Exception as e:
+        logger.error(f"Error retrieving account name for {account_id}: {e}")
+        return account_id  # Fallback to account ID if name not found
+
+def get_all_results(config_client, query):
+    """Helper to paginate through AWS Config advanced query results."""
+    results = []
+    next_token = None
+    while True:
+        if next_token:
+            response = config_client.select_resource_config(Expression=query, NextToken=next_token)
+        else:
+            response = config_client.select_resource_config(Expression=query)
+        if 'Results' in response:
+            results.extend(response['Results'])
+        next_token = response.get('NextToken')
+        if not next_token:
+            break
+    return results
+
+def get_ec2_metadata():
+    """
+    Retrieve EC2 instance metadata from AWS Config.
+    Expected fields:
+      - InstanceId (resourceId)
+      - AccountNumber (accountId)
+      - AccountName (looked up via Organizations)
+      - OSName and OSVersion (assumed provided as configuration.osName/osVersion)
+      - InstanceName (from the Name tag)
+    """
+    config_client = boto3.client('config')
+    query = (
+        "SELECT accountId, resourceId, configuration.tags.Name as InstanceName, "
+        "configuration.osName as OSName, configuration.osVersion as OSVersion "
+        "FROM ConfigurationItem WHERE resourceType = 'AWS::EC2::Instance'"
+    )
+    raw_results = get_all_results(config_client, query)
+    ec2_metadata = []
+    for item in raw_results:
+        try:
+            record = json.loads(item)
+            account_id = record.get('accountId')
+            instance_id = record.get('resourceId')
+            instance_name = record.get('InstanceName')
+            os_name = record.get('OSName')
+            os_version = record.get('OSVersion')
+            account_name = get_account_name(account_id)
+            ec2_metadata.append({
+                'InstanceId': instance_id,
+                'AccountNumber': account_id,
+                'AccountName': account_name,
+                'OSName': os_name,
+                'OSVersion': os_version,
+                'InstanceName': instance_name
+            })
+        except Exception as e:
+            logger.error(f"Error processing EC2 record: {item} Error: {e}")
+    return ec2_metadata
+
+def get_lambda_metadata():
+    """
+    Retrieve Lambda function metadata from AWS Config.
+    Expected fields:
+      - LambdaName (from configuration.functionName)
+      - AccountNumber and AccountName (via Organizations lookup)
+      - Runtime (configuration.runtime)
+      - RuntimeSoftwareVersion (configuration.runtimeSoftwareVersion)
+    """
+    config_client = boto3.client('config')
+    query = (
+        "SELECT accountId, resourceId, configuration.functionName as LambdaName, "
+        "configuration.runtime as Runtime, configuration.runtimeSoftwareVersion as RuntimeSoftwareVersion "
+        "FROM ConfigurationItem WHERE resourceType = 'AWS::Lambda::Function'"
+    )
+    raw_results = get_all_results(config_client, query)
+    lambda_metadata = []
+    for item in raw_results:
+        try:
+            record = json.loads(item)
+            account_id = record.get('accountId')
+            lambda_name = record.get('LambdaName')
+            runtime = record.get('Runtime')
+            runtime_sw_version = record.get('RuntimeSoftwareVersion')
+            account_name = get_account_name(account_id)
+            lambda_metadata.append({
+                'LambdaName': lambda_name,
+                'AccountNumber': account_id,
+                'AccountName': account_name,
+                'Runtime': runtime,
+                'RuntimeSoftwareVersion': runtime_sw_version,
+                'ResourceId': record.get('resourceId')
+            })
+        except Exception as e:
+            logger.error(f"Error processing Lambda record: {item} Error: {e}")
+    return lambda_metadata
+
+def get_network_appliances_metadata():
+    """
+    Retrieve metadata for network appliances (assumed here to be EC2 instances tagged as NetworkAppliance=true).
+    Expected fields:
+      - InstanceName (as the appliance name)
+      - AccountId and AccountName (via Organizations lookup)
+      - AMIId from configuration.imageId and enrichment from DescribeImages:
+          - AMIDescription
+          - AMIName
+          - AMILocation
+    """
+    config_client = boto3.client('config')
+    ec2_client = boto3.client('ec2')
+    query = (
+        "SELECT accountId, resourceId, configuration.imageId, configuration.tags.Name as InstanceName "
+        "FROM ConfigurationItem WHERE resourceType = 'AWS::EC2::Instance' "
+        "AND configuration.tags.NetworkAppliance = 'true'"
+    )
+    raw_results = get_all_results(config_client, query)
+    network_metadata = []
+    for item in raw_results:
+        try:
+            record = json.loads(item)
+            account_id = record.get('accountId')
+            instance_name = record.get('InstanceName')
+            # 'configuration' may not be directly accessible after JSON parse,
+            # so try to extract imageId directly from the record.
+            image_id = record.get('configuration.imageId') if record.get('configuration') else None
+            ami_description = None
+            ami_name = None
+            ami_location = None
+            if image_id:
+                try:
+                    response = ec2_client.describe_images(ImageIds=[image_id])
+                    images = response.get('Images', [])
+                    if images:
+                        image_info = images[0]
+                        ami_description = image_info.get('Description')
+                        ami_name = image_info.get('Name')
+                        ami_location = image_info.get('ImageLocation')
+                except Exception as e:
+                    logger.error(f"Error fetching AMI details for {image_id}: {e}")
+            account_name = get_account_name(account_id)
+            network_metadata.append({
+                'InstanceName': instance_name,
+                'AccountId': account_id,
+                'AccountName': account_name,
+                'AMIId': image_id,
+                'AMIDescription': ami_description,
+                'AMIName': ami_name,
+                'AMILocation': ami_location
+            })
+        except Exception as e:
+            logger.error(f"Error processing network appliance record: {item} Error: {e}")
+    return network_metadata
+
+def lambda_handler(event, context):
+    logger.info("Starting metadata retrieval from AWS Config.")
+    
+    ec2_data = get_ec2_metadata()
+    lambda_data = get_lambda_metadata()
+    network_data = get_network_appliances_metadata()
+    
+    result = {
+        'EC2_Metadata': ec2_data,
+        'Lambda_Metadata': lambda_data,
+        'NetworkAppliances_Metadata': network_data
+    }
+    
+    logger.info("Metadata retrieval complete.")
+    
+    # For demonstration, return the consolidated JSON result.
+    # In production you might store the result in S3 or push it elsewhere.
+    return {
+        'statusCode': 200,
+        'body': json.dumps(result, indent=2)
+    }
