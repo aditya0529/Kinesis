@@ -1,10 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   CloudFormation template to deploy a Lambda function that retrieves metadata from AWS Config.
-  It queries for:
+  The function queries for:
     - EC2 Instances (InstanceId, AccountNumber, AccountName, OSName, OSVersion, InstanceName)
     - Lambda Functions (LambdaName, AccountNumber, AccountName, Runtime, RuntimeSoftwareVersion)
-    - Network Appliances (EC2 instances tagged with NetworkAppliance=true and enriched with AMI details)
+    - Network Appliances (EC2 instances tagged with NetworkAppliance=true enriched with AMI details)
+  The function logs each metadata object separately so that they can be viewed in CloudWatch Logs.
 
 Parameters:
   LambdaTimeout:
@@ -112,7 +113,7 @@ Resources:
           def get_ec2_metadata():
               """
               Retrieve EC2 instance metadata from AWS Config.
-              Expected fields from the query:
+              Expected fields:
                 - accountId, resourceId,
                 - configuration.tags.Name,
                 - configuration.osName, configuration.osVersion
@@ -148,7 +149,7 @@ Resources:
           def get_lambda_metadata():
               """
               Retrieve Lambda function metadata from AWS Config.
-              Expected fields from the query:
+              Expected fields:
                 - accountId, resourceId,
                 - configuration.functionName,
                 - configuration.runtime,
@@ -186,11 +187,11 @@ Resources:
               Retrieve metadata for network appliances.
               Here we assume network appliances are modeled as EC2 instances with a tag:
                   NetworkAppliance=true
-              and that we need to enrich the data with AMI details.
-              Expected fields from the query:
+              Expected fields:
                 - accountId, resourceId,
                 - configuration.imageId,
                 - configuration.tags.Name
+              Enriches the data with AMI details.
               """
               config_client = boto3.client('config')
               ec2_client = boto3.client('ec2')
@@ -240,8 +241,13 @@ Resources:
               logger.info("Starting metadata retrieval from AWS Config.")
               
               ec2_data = get_ec2_metadata()
+              logger.info("EC2 Metadata: %s", json.dumps(ec2_data, indent=2))
+              
               lambda_data = get_lambda_metadata()
+              logger.info("Lambda Metadata: %s", json.dumps(lambda_data, indent=2))
+              
               network_data = get_network_appliances_metadata()
+              logger.info("Network Appliances Metadata: %s", json.dumps(network_data, indent=2))
               
               result = {
                   'EC2_Metadata': ec2_data,
