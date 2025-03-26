@@ -1,10 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   CloudFormation template to deploy a Lambda function that retrieves metadata from AWS Config.
-  The Lambda function queries for:
+  It queries for:
     - EC2 Instances (InstanceId, AccountNumber, AccountName, OSName, OSVersion, InstanceName)
     - Lambda Functions (LambdaName, AccountNumber, AccountName, Runtime, RuntimeSoftwareVersion)
-    - Network Appliances (modeled as EC2 instances with tag NetworkAppliance=true, with AMI details)
+    - Network Appliances (EC2 instances tagged with NetworkAppliance=true and enriched with AMI details)
 
 Parameters:
   LambdaTimeout:
@@ -71,14 +71,14 @@ Resources:
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
 
-          # Simple cache for account names to avoid duplicate Organizations calls.
+          # Cache for account names to avoid duplicate calls to Organizations.
           account_name_cache = {}
           org_client = boto3.client('organizations')
 
           def get_account_name(account_id):
               """
               Retrieves the account name from AWS Organizations.
-              Uses a cache to avoid redundant calls.
+              Uses an in-memory cache to avoid redundant calls.
               """
               if account_id in account_name_cache:
                   return account_name_cache[account_id]
@@ -112,16 +112,15 @@ Resources:
           def get_ec2_metadata():
               """
               Retrieve EC2 instance metadata from AWS Config.
-              Expected fields:
-                - InstanceId (resourceId)
-                - AccountNumber (accountId)
-                - OSName and OSVersion (assumed provided as configuration.osName / osVersion)
-                - InstanceName from the Name tag (configuration.tags.Name)
+              Expected fields from the query:
+                - accountId, resourceId,
+                - configuration.tags.Name,
+                - configuration.osName, configuration.osVersion
+              The function renames fields for clarity.
               """
               config_client = boto3.client('config')
               query = (
-                  "SELECT accountId, resourceId, configuration.tags.Name as InstanceName, "
-                  "configuration.osName as OSName, configuration.osVersion as OSVersion "
+                  "SELECT accountId, resourceId, configuration.tags.Name, configuration.osName, configuration.osVersion "
                   "FROM ConfigurationItem WHERE resourceType = 'AWS::EC2::Instance'"
               )
               raw_results = get_all_results(config_client, query)
@@ -131,9 +130,10 @@ Resources:
                       record = json.loads(item)
                       account_id = record.get('accountId')
                       instance_id = record.get('resourceId')
-                      instance_name = record.get('InstanceName')
-                      os_name = record.get('OSName')
-                      os_version = record.get('OSVersion')
+                      # Read the value directly from the returned key.
+                      instance_name = record.get('configuration.tags.Name')
+                      os_name = record.get('configuration.osName')
+                      os_version = record.get('configuration.osVersion')
                       account_name = get_account_name(account_id)
                       ec2_metadata.append({
                           'InstanceId': instance_id,
@@ -150,16 +150,15 @@ Resources:
           def get_lambda_metadata():
               """
               Retrieve Lambda function metadata from AWS Config.
-              Expected fields:
-                - LambdaName (configuration.functionName)
-                - AccountNumber and AccountName
-                - Runtime (configuration.runtime)
-                - RuntimeSoftwareVersion (configuration.runtimeSoftwareVersion)
+              Expected fields from the query:
+                - accountId, resourceId,
+                - configuration.functionName,
+                - configuration.runtime,
+                - configuration.runtimeSoftwareVersion
               """
               config_client = boto3.client('config')
               query = (
-                  "SELECT accountId, resourceId, configuration.functionName as LambdaName, "
-                  "configuration.runtime as Runtime, configuration.runtimeSoftwareVersion as RuntimeSoftwareVersion "
+                  "SELECT accountId, resourceId, configuration.functionName, configuration.runtime, configuration.runtimeSoftwareVersion "
                   "FROM ConfigurationItem WHERE resourceType = 'AWS::Lambda::Function'"
               )
               raw_results = get_all_results(config_client, query)
@@ -168,9 +167,9 @@ Resources:
                   try:
                       record = json.loads(item)
                       account_id = record.get('accountId')
-                      lambda_name = record.get('LambdaName')
-                      runtime = record.get('Runtime')
-                      runtime_sw_version = record.get('RuntimeSoftwareVersion')
+                      lambda_name = record.get('configuration.functionName')
+                      runtime = record.get('configuration.runtime')
+                      runtime_sw_version = record.get('configuration.runtimeSoftwareVersion')
                       account_name = get_account_name(account_id)
                       lambda_metadata.append({
                           'LambdaName': lambda_name,
@@ -189,17 +188,16 @@ Resources:
               Retrieve metadata for network appliances.
               Here we assume network appliances are modeled as EC2 instances with a tag:
                   NetworkAppliance=true
-              and retrieve additional AMI details.
-              Expected fields:
-                - InstanceName (appliance name)
-                - AccountId and AccountName
-                - AMIId from configuration.imageId
-                - AMIDescription, AMIName, and AMILocation from EC2 DescribeImages
+              and that we need to enrich the data with AMI details.
+              Expected fields from the query:
+                - accountId, resourceId,
+                - configuration.imageId,
+                - configuration.tags.Name
               """
               config_client = boto3.client('config')
               ec2_client = boto3.client('ec2')
               query = (
-                  "SELECT accountId, resourceId, configuration.imageId, configuration.tags.Name as InstanceName "
+                  "SELECT accountId, resourceId, configuration.imageId, configuration.tags.Name "
                   "FROM ConfigurationItem WHERE resourceType = 'AWS::EC2::Instance' "
                   "AND configuration.tags.NetworkAppliance = 'true'"
               )
@@ -209,7 +207,7 @@ Resources:
                   try:
                       record = json.loads(item)
                       account_id = record.get('accountId')
-                      instance_name = record.get('InstanceName')
+                      instance_name = record.get('configuration.tags.Name')
                       image_id = None
                       if 'configuration' in record and isinstance(record['configuration'], dict):
                           image_id = record['configuration'].get('imageId')
