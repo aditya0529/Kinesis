@@ -71,7 +71,7 @@ Resources:
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
 
-          # Cache for account names to avoid duplicate calls to Organizations.
+          # Cache for account names to avoid duplicate Organizations calls.
           account_name_cache = {}
           org_client = boto3.client('organizations')
 
@@ -116,12 +116,11 @@ Resources:
                 - accountId, resourceId,
                 - configuration.tags.Name,
                 - configuration.osName, configuration.osVersion
-              The function renames fields for clarity.
               """
               config_client = boto3.client('config')
               query = (
                   "SELECT accountId, resourceId, configuration.tags.Name, configuration.osName, configuration.osVersion "
-                  "FROM ConfigurationItem WHERE resourceType = 'AWS::EC2::Instance'"
+                  "WHERE resourceType = 'AWS::EC2::Instance'"
               )
               raw_results = get_all_results(config_client, query)
               ec2_metadata = []
@@ -130,7 +129,6 @@ Resources:
                       record = json.loads(item)
                       account_id = record.get('accountId')
                       instance_id = record.get('resourceId')
-                      # Read the value directly from the returned key.
                       instance_name = record.get('configuration.tags.Name')
                       os_name = record.get('configuration.osName')
                       os_version = record.get('configuration.osVersion')
@@ -159,7 +157,7 @@ Resources:
               config_client = boto3.client('config')
               query = (
                   "SELECT accountId, resourceId, configuration.functionName, configuration.runtime, configuration.runtimeSoftwareVersion "
-                  "FROM ConfigurationItem WHERE resourceType = 'AWS::Lambda::Function'"
+                  "WHERE resourceType = 'AWS::Lambda::Function'"
               )
               raw_results = get_all_results(config_client, query)
               lambda_metadata = []
@@ -198,8 +196,7 @@ Resources:
               ec2_client = boto3.client('ec2')
               query = (
                   "SELECT accountId, resourceId, configuration.imageId, configuration.tags.Name "
-                  "FROM ConfigurationItem WHERE resourceType = 'AWS::EC2::Instance' "
-                  "AND configuration.tags.NetworkAppliance = 'true'"
+                  "WHERE resourceType = 'AWS::EC2::Instance' AND configuration.tags.NetworkAppliance = 'true'"
               )
               raw_results = get_all_results(config_client, query)
               network_metadata = []
