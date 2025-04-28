@@ -1,0 +1,23 @@
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig 
+    extends WebSecurityConfigurerAdapter {
+    @Override
+    protected void configure(HttpSecurity http) throws Exception {
+        http
+          .csrf(csrf -> csrf
+            .csrfTokenRepository(cookieCsrfTokenRepository())
+          )
+          .authorizeRequests(authz -> authz
+            .anyRequest().permitAll()
+          );
+    }
+
+    private CookieCsrfTokenRepository cookieCsrfTokenRepository() {
+        CookieCsrfTokenRepository repo 
+          = CookieCsrfTokenRepository.withHttpOnlyFalse();
+        repo.setCookieName("XSRF-TOKEN");
+        repo.setCookiePath("/");
+        return repo;
+    }
+}
