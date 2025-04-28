@@ -1,23 +1,53 @@
 @Configuration
 @EnableWebSecurity
-public class SecurityConfig 
-    extends WebSecurityConfigurerAdapter {
+public class SecurityConfig extends WebSecurityConfigurerAdapter {
+
     @Override
     protected void configure(HttpSecurity http) throws Exception {
         http
+          //–– Choose one of the two repositories:
           .csrf(csrf -> csrf
-            .csrfTokenRepository(cookieCsrfTokenRepository())
+              //.csrfTokenRepository(cookieCsrfTokenRepository())
+              .csrfTokenRepository(httpSessionCsrfTokenRepository())
           )
+          //–– If you omit authorizeRequests(), a default rule of “anyRequest().authenticated()” is applied
           .authorizeRequests(authz -> authz
-            .anyRequest().permitAll()
+              .anyRequest().permitAll()
           );
     }
 
+    /**
+     * Stores the CSRF token in a cookie named “XSRF-TOKEN”.
+     * Pros:
+     *  - Token is automatically sent to the browser as a cookie.
+     *  - JavaScript (e.g. for AJAX) can read it if HttpOnly=false.
+     *  - Stateless across servers—no server-side session needed.
+     * Cons:
+     *  - Cookie size limits apply.
+     *  - Must secure cookie (SameSite, Secure flags) manually if needed.
+     */
     private CookieCsrfTokenRepository cookieCsrfTokenRepository() {
-        CookieCsrfTokenRepository repo 
-          = CookieCsrfTokenRepository.withHttpOnlyFalse();
+        CookieCsrfTokenRepository repo = CookieCsrfTokenRepository.withHttpOnlyFalse();
         repo.setCookieName("XSRF-TOKEN");
         repo.setCookiePath("/");
+        // Optionally: repo.setCookieSecure(true); repo.setCookieHttpOnly(false);
+        return repo;
+    }
+
+    /**
+     * Stores the CSRF token in the HttpSession under attribute "_csrf".
+     * Pros:
+     *  - No cookie overhead; token stays server-side.
+     *  - Simpler for traditional server‐rendered apps (hidden field only).
+     * Cons:
+     *  - Requires an active server session.
+     *  - JavaScript can’t read it; you must render it into your pages manually.
+     */
+    private HttpSessionCsrfTokenRepository httpSessionCsrfTokenRepository() {
+        HttpSessionCsrfTokenRepository repo = new HttpSessionCsrfTokenRepository();
+        // by default uses attribute name HttpSessionCsrfTokenRepository.DEFAULT_CSRF_TOKEN_ATTR_NAME ("_csrf")
+        // you can override if desired:
+        // repo.setSessionAttributeName("MY_CSRF_TOKEN");
         return repo;
     }
 }
