@@ -39,6 +39,7 @@ if __name__ == "__main__":
         "us-east-1": "resource.us-east-1.config",
     }
     regions = list(region_config_files.keys())
+    primary_region = regions[0]  # Use the first region as primary for IAM
     stacks = []
 
     # Initializing CDK app
@@ -48,6 +49,9 @@ if __name__ == "__main__":
         config_parser = configparser.ConfigParser()
         config_parser.read(region_config_files[region])
         config = config_parser[branch_name]
+        config = dict(config)
+        config["primary_region"] = primary_region
+        config["deployment_region"] = region
         app_config = load_applications_from_json(f"config/canary_app_list_{branch_name}.json")
         stack = cloud_infra(
             app,
