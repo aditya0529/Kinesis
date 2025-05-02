@@ -1,0 +1,27 @@
+[dev]
+deployment_sdlc_account = 064946868561
+deployment_region = eu-central-1
+workload_account = 499909335131
+asset_prefix = sw-cdk-bootstrap-s3
+resource_suffix = main-aws
+bootstrap_stack_version = /swift/cdk-bootstrap/version
+app_env = dev
+app_name = fis
+service_name = refapp
+resource_prefix = sw
+cost_center = CA77
+main_lz_org_id = o-zwxgcm9bdz
+vpc_id = vpc-00c8c80bffe439f8a
+workload_subnet_1 = subnet-054e8b194d8eaee0b
+workload_subnet_2 = subnet-077f4ee048dc9bb07
+lb_subnet_1 = subnet-09d623231599546dd
+lb_subnet_2 = subnet-0532bbea2ebee07ed
+ecs_services = mra
+db_clusters = cl,rds-cl1,rds-cl2,rds-gc
+ecs_taks_percents = 50,100
+ecs_drain_percents = 50
+s3_prefix_list = pl-6ea54007
+subnet_az1_list = subnet-054e8b194d8eaee0b,subnet-09d623231599546dd,subnet-0b6be90893a460601,subnet-0d1a3c1e85f92efbd
+subnet_az2_list = subnet-077f4ee048dc9bb07,subnet-0532bbea2ebee07ed,subnet-06a3f829360caec73,subnet-019c40cde93c5af5d
+az1_name = eu-central-1a
+az2_name = eu-central-1b
