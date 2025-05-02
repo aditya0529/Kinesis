@@ -718,51 +718,55 @@ def handler(event, context):
         # vpc lookup from account
         vpc = self.lookup_vpc(config=config)
 
+        # Always create log group (regional resource)
         log_group = self.create_log_group(config=config)
-        fis_role = self.create_fis_role(config=config)
 
-        # FIS Experiment Template - App AZ subnet fail
-        self.create_fis_network_subnet_experiment(config=config, subnet_list=config['subnet_az1_list'],
-                                                  test_name="az1", role=fis_role, log_group=log_group,
-                                                  az_name=config['az1_name'], db_app_list=config['db_clusters']
-                                                  )
-        self.create_fis_network_subnet_experiment(config=config, subnet_list=config['subnet_az2_list'],
-                                                  test_name="az2", role=fis_role, log_group=log_group,
-                                                  az_name=config['az2_name'], db_app_list=config['db_clusters']
-                                                  )
+        # Only create IAM roles and other global resources in the primary region
+        if config.get("deployment_region") == config.get("primary_region"):
+            fis_role = self.create_fis_role(config=config)
 
-        # FIS Experiment Template - ECS stop
-        for ecs_name in config['ecs_services'].split(","):
-            for percent_val in config['ecs_taks_percents'].split(","):
-                self.create_fis_ecs_task_stop_experiment(config=config, role=fis_role, log_group=log_group,
-                                                         ecs_app_name=ecs_name, percent=percent_val
-                                                         )
+            # FIS Experiment Template - App AZ subnet fail
+            self.create_fis_network_subnet_experiment(config=config, subnet_list=config['subnet_az1_list'],
+                                                      test_name="az1", role=fis_role, log_group=log_group,
+                                                      az_name=config['az1_name'], db_app_list=config['db_clusters']
+                                                      )
+            self.create_fis_network_subnet_experiment(config=config, subnet_list=config['subnet_az2_list'],
+                                                      test_name="az2", role=fis_role, log_group=log_group,
+                                                      az_name=config['az2_name'], db_app_list=config['db_clusters']
+                                                      )
 
-        # DO NOT ENABLE ---- FIS Experiment Template - ECS CPU stress
-        # for ecs_name in config['ecs_services'].split(","):
-        #     for percent_val in config['ecs_taks_percents'].split(","):
-        #         self.create_fis_ecs_task_cpustress_experiment(config=config, role=fis_role, log_group=log_group,
-        #             ecs_app_name=ecs_name, percent=percent_val
-        #         )
+            # FIS Experiment Template - ECS stop
+            for ecs_name in config['ecs_services'].split(","):
+                for percent_val in config['ecs_taks_percents'].split(","):
+                    self.create_fis_ecs_task_stop_experiment(config=config, role=fis_role, log_group=log_group,
+                                                             ecs_app_name=ecs_name, percent=percent_val
+                                                             )
 
-        # DO NOT ENABLE ---- FIS Experiment Template - ECS IO stress - Future test cases
-        # for ecs_name in config['ecs_services'].split(","):
-        #     for percent_val in config['ecs_taks_percents'].split(","):
-        #         self.create_fis_ecs_task_iostress_experiment(config=config, role=fis_role, log_group=log_group,
-        #             ecs_app_name=ecs_name, percent=percent_val
-        #         )
+            # DO NOT ENABLE ---- FIS Experiment Template - ECS CPU stress
+            # for ecs_name in config['ecs_services'].split(","):
+            #     for percent_val in config['ecs_taks_percents'].split(","):
+            #         self.create_fis_ecs_task_cpustress_experiment(config=config, role=fis_role, log_group=log_group,
+            #             ecs_app_name=ecs_name, percent=percent_val
+            #         )
 
-        # for percent_val in config['ecs_drain_percents'].split(","):
-        #     self.create_fis_ecs_cluster_drain_experiment(config=config, role=fis_role,
-        #         log_group=log_group, percent=percent_val
-        #     )
+            # DO NOT ENABLE ---- FIS Experiment Template - ECS IO stress - Future test cases
+            # for ecs_name in config['ecs_services'].split(","):
+            #     for percent_val in config['ecs_taks_percents'].split(","):
+            #         self.create_fis_ecs_task_iostress_experiment(config=config, role=fis_role, log_group=log_group,
+            #             ecs_app_name=ecs_name, percent=percent_val
+            #         )
 
-        for db_name in config['db_clusters'].split(","):
-            self.create_fis_rds_failover_experiment(config=config, role=fis_role, log_group=log_group, db_app_name=db_name)
+            # for percent_val in config['ecs_drain_percents'].split(","):
+            #     self.create_fis_ecs_cluster_drain_experiment(config=config, role=fis_role,
+            #         log_group=log_group, percent=percent_val
+            #     )
+
+            for db_name in config['db_clusters'].split(","):
+                self.create_fis_rds_failover_experiment(config=config, role=fis_role, log_group=log_group, db_app_name=db_name)
 
         # synthetics canary
-
-        canary_role = self.create_canary_role(config=config, bucket_name=bucket.bucket_name)
+        if config.get("deployment_region") == config.get("primary_region"):
+            canary_role = self.create_canary_role(config=config, bucket_name=bucket.bucket_name)
         canary_script = self.canary_script_data(config=config)
         canary_sg = self.create_canary_security_group(config=config, vpc=vpc)
 
